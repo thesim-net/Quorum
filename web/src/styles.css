@@ -455,6 +455,16 @@ label > span.field-label {
   margin-bottom: 0.25rem;
 }
 
+/* Update-available banner on the admin page. */
+.update-banner {
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-left: 3px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border-radius: var(--radius);
+  padding: 0.9rem 1.1rem;
+  margin-bottom: 1rem;
+}
+
 /* Save controls, with their result beside them. */
 .savebar {
   position: sticky;

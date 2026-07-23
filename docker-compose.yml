@@ -15,6 +15,9 @@ services:
       retries: 10
 
   api:
+    # Self-hosters pull the published image; `docker compose build` (or
+    # `up --build`) rebuilds locally for development.
+    image: ghcr.io/thomasloupe/quorum-api:${QUORUM_VERSION:-latest}
     build:
       context: ./api
     restart: unless-stopped
@@ -46,6 +49,7 @@ services:
       - uploads:/data/uploads
 
   web:
+    image: ghcr.io/thomasloupe/quorum-web:${QUORUM_VERSION:-latest}
     build:
       context: ./web
       args:

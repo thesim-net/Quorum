@@ -18,6 +18,7 @@ import {
   isPluginEnabled,
   sanitisePlugins,
 } from '../lib/plugins.js';
+import { updateStatus } from '../lib/update.js';
 import { requireAdmin, requirePanel, requirePermission } from '../middleware/session.js';
 import {
   ALL_PERMISSIONS,
@@ -37,6 +38,20 @@ const writeSurveys = requirePermission(PERMISSIONS.SURVEYS_WRITE);
 const publishSurveys = requirePermission(PERMISSIONS.SURVEYS_PUBLISH);
 const deleteSurveys = requirePermission(PERMISSIONS.SURVEYS_DELETE);
 const readResults = requirePermission(PERMISSIONS.RESULTS_READ);
+
+/**
+ * Reports whether a newer version is available.
+ *
+ * Super-admin only: updating is a deployment concern. The check itself is
+ * cached and never fails the request.
+ */
+adminRouter.get('/update', requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await updateStatus(req.query.refresh === '1'));
+  } catch (error) {
+    next(error);
+  }
+});
 
 /** Reports the caller's own permissions, so the UI can hide what they cannot do. */
 adminRouter.get('/me', (req, res) => {

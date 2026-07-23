@@ -27,6 +27,12 @@ You will need a [Discord application](https://discord.com/developers/application
 
 Requested OAuth scopes are kept to `identify` alone. The bot token is what makes channel gating, gate configuration, adding admins by user ID, and prompt access revocation possible, because Discord exposes no OAuth scope for a guild's channel overwrites or role permissions.
 
+## Updating
+
+The admin page shows a banner when a newer version is published. To update, run `./update.sh` from the folder holding your `docker-compose.yml` (or `docker compose pull && docker compose up -d`). New database migrations run automatically when the new version starts; your data volumes are untouched.
+
+Releases are published to GHCR by a GitHub Action on each `v*` tag. To cut one: bump the version in `api/package.json` and `web/package.json`, then `git tag v1.2.3 && git push --tags`.
+
 ## Privacy model
 
 - **Respondent identity is pseudonymous by default.** Each response stores `HMAC(per-survey key, pepper + discord_id)`, never the raw id, unless the survey has "record username" enabled. The key is per survey, so responses cannot be correlated across surveys.

@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
@@ -14,6 +13,7 @@ import { surveyRouter } from './routes/surveys.js';
 import { loadSession } from './middleware/session.js';
 import { ensureSetupTokenIfNeeded, loadSettings } from './lib/settings.js';
 import { startScheduler } from './lib/scheduler.js';
+import { VERSION } from './lib/version.js';
 
 const app = express();
 
@@ -26,14 +26,8 @@ app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '256kb' }));
 app.use(cookieParser());
 
-// Read once at boot so the version is a single source of truth from
-// package.json, ready for the planned auto-update and migration tooling.
-const version = JSON.parse(
-  readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
-).version;
-
-app.get('/api/health', (_req, res) => res.json({ ok: true, version }));
-app.get('/api/version', (_req, res) => res.json({ version }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, version: VERSION }));
+app.get('/api/version', (_req, res) => res.json({ version: VERSION }));
 
 app.use(
   '/api/auth',

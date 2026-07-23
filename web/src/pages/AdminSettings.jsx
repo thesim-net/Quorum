@@ -14,6 +14,8 @@ export function AdminSettings() {
   const [setupState, setSetupState] = useState(null);
   const [me, setMe] = useState(null);
   const [version, setVersion] = useState('');
+  const [update, setUpdate] = useState(null);
+  const [showUpdate, setShowUpdate] = useState(false);
   const [confirmSetup, setConfirmSetup] = useState(false);
   const navigate = useNavigate();
 
@@ -21,6 +23,9 @@ export function AdminSettings() {
     api('/setup/state').then(setSetupState).catch(() => setSetupState(null));
     api('/admin/me').then(setMe).catch(() => setMe(null));
     api('/version').then((v) => setVersion(v.version)).catch(() => setVersion(''));
+    // Super-admin only on the server; a 403 for a plain admin just leaves the
+    // banner hidden.
+    api('/admin/update').then(setUpdate).catch(() => setUpdate(null));
   }, []);
 
   if (!me) return <div className="shell muted">Loading...</div>;
@@ -28,6 +33,40 @@ export function AdminSettings() {
   return (
     <div className="shell">
       <h1>Admin</h1>
+
+      {update?.updateAvailable ? (
+        <div className="update-banner">
+          <div className="row" style={{ justifyContent: 'space-between' }}>
+            <span>
+              <strong>Update available:</strong> Quorum {update.latest} (you have v{version}).
+            </span>
+            <span className="row" style={{ gap: '0.5rem' }}>
+              {update.url ? (
+                <a className="button" href={update.url} target="_blank" rel="noreferrer">
+                  Release notes
+                </a>
+              ) : null}
+              <button type="button" className="primary" onClick={() => setShowUpdate((v) => !v)}>
+                {showUpdate ? 'Hide' : 'Update'}
+              </button>
+            </span>
+          </div>
+
+          {showUpdate ? (
+            <div style={{ marginTop: '0.75rem' }}>
+              <p className="muted" style={{ marginTop: 0 }}>
+                From the folder holding your <code>docker-compose.yml</code>, run:
+              </p>
+              <pre className="codeblock">./update.sh</pre>
+              <p className="muted" style={{ fontSize: '0.82rem', marginBottom: 0 }}>
+                This pulls the new images and restarts. Database migrations run automatically when
+                the new version starts. Or run it by hand:{' '}
+                <code>docker compose pull && docker compose up -d</code>.
+              </p>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
 
       {/* Plain admins see a filtered, read-only version; the server decides
           what is in it. */}

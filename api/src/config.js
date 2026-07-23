@@ -73,6 +73,8 @@ export const config = {
   geoipDbPath: process.env.GEOIP_DB_PATH ?? '',
   // Local directory holding uploaded file answers.
   uploadsDir: process.env.UPLOADS_DIR ?? '/data/uploads',
+  // Update checking (UPDATE_CHECK, UPDATE_CHECK_REPO) is read directly from the
+  // environment in lib/update.js.
   // Number of proxies in front of the API, used to pick the client IP out of
   // X-Forwarded-For without trusting a client-supplied header.
   trustProxyHops: Number(process.env.TRUST_PROXY_HOPS ?? 1),
