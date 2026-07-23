@@ -1,0 +1,61 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-quorum}
+      POSTGRES_USER: ${POSTGRES_USER:-quorum}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-quorum} -d ${POSTGRES_DB:-quorum}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ./api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgres://${POSTGRES_USER:-quorum}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-quorum}
+      PUBLIC_URL: ${PUBLIC_URL:?PUBLIC_URL is required}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
+      RESPONDENT_PEPPER: ${RESPONDENT_PEPPER:?RESPONDENT_PEPPER is required}
+      # Optional. Leave unset and connect Discord through the setup wizard,
+      # which stores the credentials encrypted in the database so they survive
+      # a redeploy. Setting all four instead pins configuration to the
+      # environment and makes the wizard read-only.
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+      BOOTSTRAP_ADMIN_IDS: ${BOOTSTRAP_ADMIN_IDS:-}
+      ADMIN_ROLE_IDS: ${ADMIN_ROLE_IDS:-}
+      GEOIP_DB_PATH: ${GEOIP_DB_PATH:-/data/geoip/GeoLite2-Country.mmdb}
+      UPLOADS_DIR: /data/uploads
+      TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-1}
+    volumes:
+      - ./data/geoip:/data/geoip:ro
+      - uploads:/data/uploads
+
+  web:
+    build:
+      context: ./web
+      args:
+        VITE_PUBLIC_URL: ${PUBLIC_URL}
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+
+volumes:
+  db_data:
+  uploads:

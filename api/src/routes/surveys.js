@@ -1,0 +1,683 @@
+import { Router } from 'express';
+import multer from 'multer';
+import { query, transaction } from '../db/pool.js';
+import { AnswerError, normaliseAnswer } from '../lib/answers.js';
+import { visibleQuestions } from '../lib/conditional.js';
+import { PLUGINS, isPluginEnabled } from '../lib/plugins.js';
+import { current } from '../lib/settings.js';
+import { evaluateGate } from '../lib/gate.js';
+import { countryOf } from '../lib/geo.js';
+import { respondentHash } from '../lib/respondent.js';
+import { collapseEvents, totalDuration } from '../lib/timing.js';
+import {
+  HARD_MAX_BYTES,
+  UploadError,
+  deleteFile,
+  mimeForName,
+  storeFile,
+  validateUpload,
+} from '../lib/uploads.js';
+import { requireMember } from '../middleware/session.js';
+
+export const surveyRouter = Router();
+
+surveyRouter.use(requireMember);
+
+// Files are held in memory just long enough to validate and write them. The
+// ceiling here is the absolute maximum; each question enforces its own,
+// smaller, limit once the file is in hand.
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: HARD_MAX_BYTES, files: 1 },
+});
+
+/**
+ * Whether a survey is currently accepting responses.
+ *
+ * The scheduled window is honoured alongside the status flag, so a survey can
+ * be set to open ahead of time and close itself.
+ *
+ * @param {object} survey Survey row.
+ * @returns {boolean} True when participants may submit.
+ */
+function isAcceptingResponses(survey) {
+  if (survey.status !== 'open') return false;
+
+  const now = Date.now();
+  if (survey.opens_at && now < new Date(survey.opens_at).getTime()) return false;
+  if (survey.closes_at && now > new Date(survey.closes_at).getTime()) return false;
+  return true;
+}
+
+/**
+ * The collection toggles a participant is shown before starting.
+ *
+ * @param {object} survey Survey row.
+ * @returns {{timing: boolean, location: boolean, identity: boolean}} Disclosures.
+ */
+const disclosures = (survey) => ({
+  timing: survey.collect_timing,
+  location: survey.collect_location,
+  identity: survey.collect_identity,
+});
+
+/**
+ * Loads a survey by slug and confirms the caller may see it.
+ *
+ * @param {string} slug Survey slug.
+ * @param {object} user Signed-in member from `req.user`.
+ * @returns {Promise<{survey: object}|{error: string, status: number}>} The
+ *   survey, or a refusal with the status to send.
+ */
+async function loadAccessibleSurvey(slug, user) {
+  const { rows } = await query('SELECT * FROM surveys WHERE slug = $1', [slug]);
+  if (rows.length === 0) return { error: 'Survey not found.', status: 404 };
+
+  const survey = rows[0];
+  if (survey.status === 'draft') return { error: 'Survey not found.', status: 404 };
+
+  const gate = await evaluateGate(survey, user);
+  if (!gate.allowed) return { error: gate.reason, status: 403 };
+
+  return { survey };
+}
+
+/**
+ * Finds the caller's response to a survey, if any.
+ *
+ * @param {object} survey Survey row, for its respondent key.
+ * @param {string} discordId
+ * @returns {Promise<object|null>} Response row, or null.
+ */
+async function findOwnResponse(survey, discordId) {
+  const hash = respondentHash(survey.respondent_key, discordId);
+  const { rows } = await query(
+    'SELECT * FROM responses WHERE survey_id = $1 AND respondent_hash = $2',
+    [survey.id, hash],
+  );
+  return rows[0] ?? null;
+}
+
+/** Lists every open survey the caller can access. */
+surveyRouter.get('/', async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT * FROM surveys
+        WHERE status = 'open'
+          AND (opens_at IS NULL OR opens_at <= now())
+          AND (closes_at IS NULL OR closes_at > now())
+        ORDER BY created_at DESC`,
+    );
+
+    const visible = [];
+    for (const survey of rows) {
+      const gate = await evaluateGate(survey, req.user);
+      if (!gate.allowed) continue;
+
+      const own = await findOwnResponse(survey, req.user.discordId);
+      visible.push({
+        slug: survey.slug,
+        title: survey.title,
+        description: survey.description,
+        closesAt: survey.closes_at,
+        disclosures: disclosures(survey),
+        allowsEdits: survey.allow_response_edits,
+        myStatus: own?.status ?? null,
+      });
+    }
+
+    res.json({ surveys: visible });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * Returns the intro screen for a survey.
+ *
+ * The disclosures here are what the participant sees before answering
+ * anything, which is the point at which every collection toggle is declared.
+ */
+surveyRouter.get('/:slug', async (req, res, next) => {
+  try {
+    const result = await loadAccessibleSurvey(req.params.slug, req.user);
+    if (result.error) return res.status(result.status).json({ error: result.error, code: result.code });
+
+    const { survey } = result;
+    const own = await findOwnResponse(survey, req.user.discordId);
+
+    const { rows: counts } = await query(
+      'SELECT count(*)::int AS n FROM questions WHERE survey_id = $1',
+      [survey.id],
+    );
+
+    return res.json({
+      survey: {
+        slug: survey.slug,
+        title: survey.title,
+        description: survey.description,
+        status: survey.status,
+        opensAt: survey.opens_at,
+        closesAt: survey.closes_at,
+        questionCount: counts[0].n,
+        disclosures: disclosures(survey),
+        allowsEdits: survey.allow_response_edits,
+        accepting: isAcceptingResponses(survey),
+      },
+      myResponse: own
+        ? { id: own.id, status: own.status, completedAt: own.completed_at }
+        : null,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * Reports whether a survey is still taking answers.
+ *
+ * Deliberately minimal - one indexed row, no gate evaluation and no Discord
+ * call - because a participant polls it while they answer, so that closing a
+ * survey reaches them promptly instead of at their next submit.
+ */
+surveyRouter.get('/:slug/status', async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      'SELECT status, opens_at, closes_at FROM surveys WHERE slug = $1',
+      [req.params.slug],
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Survey not found.' });
+
+    return res.json({ accepting: isAcceptingResponses(rows[0]) });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * Starts, or resumes, the caller's response.
+ *
+ * Re-entering a completed survey is only permitted when the survey allows
+ * edits; otherwise the existing response is returned as read-only.
+ */
+surveyRouter.post('/:slug/start', async (req, res, next) => {
+  try {
+    const result = await loadAccessibleSurvey(req.params.slug, req.user);
+    if (result.error) return res.status(result.status).json({ error: result.error, code: result.code });
+
+    const { survey } = result;
+    if (!isAcceptingResponses(survey)) {
+      return res.status(409).json({
+        error: 'The survey has been closed and is no longer accepting answers at this time.',
+        code: 'survey_closed',
+      });
+    }
+
+    const hash = respondentHash(survey.respondent_key, req.user.discordId);
+    const existing = await findOwnResponse(survey, req.user.discordId);
+
+    if (existing?.status === 'completed' && !survey.allow_response_edits) {
+      return res.status(409).json({ error: 'You have already completed this survey.' });
+    }
+
+    let response = existing;
+    if (!response) {
+      const country = survey.collect_location ? await countryOf(req) : null;
+
+      // The raw Discord id is recorded only when the survey declares it.
+      const { rows } = await query(
+        `INSERT INTO responses (survey_id, respondent_hash, user_id, country_code)
+         VALUES ($1, $2, $3, $4) RETURNING *`,
+        [survey.id, hash, survey.collect_identity ? req.user.id : null, country],
+      );
+      response = rows[0];
+    }
+
+    const { rows: questions } = await query(
+      `SELECT q.id, q.position, q.type, q.prompt, q.help_text, q.required, q.config
+         FROM questions q WHERE q.survey_id = $1 ORDER BY q.position`,
+      [survey.id],
+    );
+
+    const { rows: options } = await query(
+      `SELECT o.id, o.question_id, o.position, o.label
+         FROM question_options o
+         JOIN questions q ON q.id = o.question_id
+        WHERE q.survey_id = $1 ORDER BY o.position`,
+      [survey.id],
+    );
+
+    const { rows: answers } = await query(
+      'SELECT question_id, value FROM answers WHERE response_id = $1',
+      [response.id],
+    );
+
+    const optionsByQuestion = new Map();
+    for (const option of options) {
+      if (!optionsByQuestion.has(option.question_id)) optionsByQuestion.set(option.question_id, []);
+      optionsByQuestion.get(option.question_id).push({ id: option.id, label: option.label });
+    }
+
+    return res.json({
+      response: { id: response.id, status: response.status },
+      questions: questions.map((q) => ({
+        id: q.id,
+        type: q.type,
+        prompt: q.prompt,
+        helpText: q.help_text,
+        required: q.required,
+        config: q.config,
+        options: optionsByQuestion.get(q.id) ?? [],
+      })),
+      answers: Object.fromEntries(answers.map((a) => [a.question_id, a.value])),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * Loads a response the caller owns and is still allowed to write to.
+ *
+ * @param {string} responseId
+ * @param {object} user Signed-in member from `req.user`.
+ * @returns {Promise<{response: object, survey: object}|{error: string, status: number}>}
+ *   The response and its survey, or a refusal.
+ */
+async function loadOwnWritableResponse(responseId, user) {
+  const { rows } = await query(
+    `SELECT r.id, r.survey_id, r.respondent_hash, r.status, r.started_at, r.completed_at,
+            s.id AS s_id, s.slug, s.status AS s_status, s.opens_at, s.closes_at,
+            s.allow_response_edits, s.collect_timing, s.collect_location, s.collect_identity,
+            s.respondent_key
+       FROM responses r JOIN surveys s ON s.id = r.survey_id
+      WHERE r.id = $1`,
+    [responseId],
+  );
+  if (rows.length === 0) return { error: 'Response not found.', status: 404 };
+
+  const row = rows[0];
+  const survey = {
+    id: row.s_id,
+    slug: row.slug,
+    status: row.s_status,
+    opens_at: row.opens_at,
+    closes_at: row.closes_at,
+    allow_response_edits: row.allow_response_edits,
+    collect_timing: row.collect_timing,
+    collect_location: row.collect_location,
+    collect_identity: row.collect_identity,
+  };
+  const response = {
+    id: row.id,
+    survey_id: row.survey_id,
+    respondent_hash: row.respondent_hash,
+    status: row.status,
+  };
+
+  // A mismatched hash means the response belongs to someone else. It is
+  // reported as "not found" so the route cannot be used to probe for who
+  // has responded to a survey.
+  const expected = respondentHash(row.respondent_key, user.discordId);
+  if (!expected.equals(response.respondent_hash)) {
+    return { error: 'Response not found.', status: 404 };
+  }
+  if (!isAcceptingResponses(survey)) {
+    // Tagged so the participant's client can show a proper closed screen
+    // rather than surfacing this as a validation error on whatever question
+    // they happened to be looking at.
+    return {
+      error: 'The survey has been closed and is no longer accepting answers at this time.',
+      status: 409,
+      code: 'survey_closed',
+    };
+  }
+  if (response.status === 'completed' && !survey.allow_response_edits) {
+    return { error: 'This survey does not allow changing answers.', status: 409 };
+  }
+
+  return { response, survey };
+}
+
+/** Saves a single answer, so progress survives a closed tab. */
+surveyRouter.put('/responses/:id/answers/:questionId', async (req, res, next) => {
+  try {
+    const loaded = await loadOwnWritableResponse(req.params.id, req.user);
+    if (loaded.error) return res.status(loaded.status).json({ error: loaded.error, code: loaded.code });
+
+    const { rows: questions } = await query(
+      'SELECT * FROM questions WHERE id = $1 AND survey_id = $2',
+      [req.params.questionId, loaded.response.survey_id],
+    );
+    if (questions.length === 0) return res.status(404).json({ error: 'Question not found.' });
+
+    const question = questions[0];
+    const { rows: options } = await query(
+      'SELECT id, label FROM question_options WHERE question_id = $1 ORDER BY position',
+      [question.id],
+    );
+
+    // Partial saves accept a blank answer even on a required question; the
+    // requirement is enforced at submit, so autosave never blocks progress.
+    let value;
+    try {
+      value = normaliseAnswer({ ...question, required: false }, options, req.body?.value);
+    } catch (error) {
+      if (error instanceof AnswerError) return res.status(400).json({ error: error.message });
+      throw error;
+    }
+
+    await query(
+      `INSERT INTO answers (response_id, question_id, value)
+            VALUES ($1, $2, $3)
+       ON CONFLICT (response_id, question_id) DO UPDATE
+            SET value = EXCLUDED.value, updated_at = now()`,
+      [loaded.response.id, question.id, value],
+    );
+
+    return res.json({ ok: true, value });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * Loads the question a file is being attached to, for the caller's response.
+ *
+ * @param {string} responseId
+ * @param {string} questionId
+ * @param {object} user Signed-in member.
+ * @returns {Promise<{question: object, surveyId: string}|{error: string, status: number}>}
+ */
+async function loadFileQuestion(responseId, questionId, user) {
+  const loaded = await loadOwnWritableResponse(responseId, user);
+  if (loaded.error) return loaded;
+
+  const { rows } = await query(
+    'SELECT * FROM questions WHERE id = $1 AND survey_id = $2',
+    [questionId, loaded.response.survey_id],
+  );
+  if (rows.length === 0) return { error: 'Question not found.', status: 404 };
+  if (rows[0].type !== 'file_upload') {
+    return { error: 'This question does not take a file.', status: 400 };
+  }
+  return { question: rows[0], surveyId: loaded.response.survey_id, responseId: loaded.response.id };
+}
+
+/**
+ * Stores a file for a file-upload question.
+ *
+ * The bytes are written to disk under a random key and recorded in
+ * answer_files; the answer row then references that file. Re-uploading replaces
+ * the previous file, on disk and in the row.
+ */
+surveyRouter.post(
+  '/responses/:id/answers/:questionId/file',
+  upload.single('file'),
+  async (req, res, next) => {
+    try {
+      const loaded = await loadFileQuestion(req.params.id, req.params.questionId, req.user);
+      if (loaded.error) return res.status(loaded.status).json({ error: loaded.error, code: loaded.code });
+      if (!req.file) return res.status(400).json({ error: 'No file was received.' });
+
+      try {
+        validateUpload(loaded.question, req.file);
+      } catch (error) {
+        if (error instanceof UploadError) return res.status(400).json({ error: error.message });
+        throw error;
+      }
+
+      const storageKey = await storeFile(loaded.surveyId, req.file.buffer);
+
+      // Replace any previous file for this answer, freeing its disk space.
+      const { rows: prior } = await query(
+        'SELECT storage_key FROM answer_files WHERE response_id = $1 AND question_id = $2',
+        [loaded.responseId, req.params.questionId],
+      );
+
+      const { rows } = await query(
+        `INSERT INTO answer_files (response_id, question_id, storage_key, original_name, mime, size_bytes)
+              VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (response_id, question_id) DO UPDATE
+              SET storage_key = EXCLUDED.storage_key,
+                  original_name = EXCLUDED.original_name,
+                  mime = EXCLUDED.mime,
+                  size_bytes = EXCLUDED.size_bytes,
+                  created_at = now()
+           RETURNING id`,
+        [
+          loaded.responseId,
+          req.params.questionId,
+          storageKey,
+          req.file.originalname.slice(0, 255),
+          // Derived from the extension, never the client-declared type.
+          mimeForName(req.file.originalname),
+          req.file.size,
+        ],
+      );
+
+      for (const old of prior) await deleteFile(old.storage_key);
+
+      const value = { fileId: rows[0].id, filename: req.file.originalname, size: req.file.size };
+      await query(
+        `INSERT INTO answers (response_id, question_id, value)
+              VALUES ($1, $2, $3)
+         ON CONFLICT (response_id, question_id) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [loaded.responseId, req.params.questionId, value],
+      );
+
+      return res.json({ ok: true, value });
+    } catch (error) {
+      if (error?.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({ error: 'File is too large.' });
+      }
+      return next(error);
+    }
+  },
+);
+
+/** Removes a previously uploaded file. */
+surveyRouter.delete('/responses/:id/answers/:questionId/file', async (req, res, next) => {
+  try {
+    const loaded = await loadFileQuestion(req.params.id, req.params.questionId, req.user);
+    if (loaded.error) return res.status(loaded.status).json({ error: loaded.error, code: loaded.code });
+
+    const { rows } = await query(
+      'DELETE FROM answer_files WHERE response_id = $1 AND question_id = $2 RETURNING storage_key',
+      [loaded.responseId, req.params.questionId],
+    );
+    for (const file of rows) await deleteFile(file.storage_key);
+
+    await query('DELETE FROM answers WHERE response_id = $1 AND question_id = $2', [
+      loaded.responseId,
+      req.params.questionId,
+    ]);
+
+    return res.json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * Records that the participant moved to a question.
+ *
+ * Only the question id is accepted; the timestamp comes from the database
+ * clock, so reported durations cannot be manipulated by the client.
+ */
+surveyRouter.post('/responses/:id/enter', async (req, res, next) => {
+  try {
+    const loaded = await loadOwnWritableResponse(req.params.id, req.user);
+    if (loaded.error) return res.status(loaded.status).json({ error: loaded.error, code: loaded.code });
+    if (!loaded.survey.collect_timing) return res.json({ ok: true });
+
+    const questionId = req.body?.questionId ?? null;
+    if (questionId) {
+      const { rows } = await query(
+        'SELECT 1 FROM questions WHERE id = $1 AND survey_id = $2',
+        [questionId, loaded.response.survey_id],
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'Question not found.' });
+    }
+
+    await query(
+      `INSERT INTO response_events (response_id, question_id, kind) VALUES ($1, $2, 'enter')`,
+      [loaded.response.id, questionId],
+    );
+
+    return res.json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * Validates every answer and marks the response complete.
+ *
+ * Timing events are collapsed into per-question totals and then deleted, so no
+ * per-participant timeline is retained beyond the aggregate.
+ */
+surveyRouter.post('/responses/:id/submit', async (req, res, next) => {
+  try {
+    const loaded = await loadOwnWritableResponse(req.params.id, req.user);
+    if (loaded.error) return res.status(loaded.status).json({ error: loaded.error, code: loaded.code });
+
+    const { response, survey } = loaded;
+
+    const { rows: questions } = await query(
+      'SELECT * FROM questions WHERE survey_id = $1 ORDER BY position',
+      [survey.id],
+    );
+    const { rows: options } = await query(
+      `SELECT o.id, o.label, o.question_id FROM question_options o
+         JOIN questions q ON q.id = o.question_id WHERE q.survey_id = $1 ORDER BY o.position`,
+      [survey.id],
+    );
+    const { rows: saved } = await query(
+      'SELECT question_id, value FROM answers WHERE response_id = $1',
+      [response.id],
+    );
+
+    const optionsByQuestion = new Map();
+    for (const option of options) {
+      if (!optionsByQuestion.has(option.question_id)) optionsByQuestion.set(option.question_id, []);
+      optionsByQuestion.get(option.question_id).push(option);
+    }
+    const savedByQuestion = new Map(saved.map((a) => [a.question_id, a.value]));
+
+    // Conditional logic: a question hidden by its showIf rule is neither
+    // enforced nor stored. Its answer is dropped so a value entered before the
+    // branch closed cannot linger in the results.
+    const visible = new Set(
+      visibleQuestions(questions, savedByQuestion).map((question) => question.id),
+    );
+
+    // Re-validate everything with the real `required` flag; autosave let blanks
+    // through, and a question may have been made required since.
+    const errors = {};
+    const normalised = new Map();
+    for (const question of questions) {
+      if (!visible.has(question.id)) continue;
+      const raw = savedByQuestion.get(question.id) ?? null;
+      try {
+        normalised.set(
+          question.id,
+          normaliseAnswer(question, optionsByQuestion.get(question.id) ?? [], raw),
+        );
+      } catch (error) {
+        if (!(error instanceof AnswerError)) throw error;
+        errors[question.id] = error.message;
+      }
+    }
+
+    if (Object.keys(errors).length > 0) {
+      return res.status(400).json({ error: 'Some answers need attention.', questions: errors });
+    }
+
+    await transaction(async (client) => {
+      let perQuestion = new Map();
+
+      if (survey.collect_timing) {
+        await client.query(
+          `INSERT INTO response_events (response_id, question_id, kind)
+           VALUES ($1, NULL, 'submit')`,
+          [response.id],
+        );
+
+        const { rows: events } = await client.query(
+          'SELECT question_id, at FROM response_events WHERE response_id = $1 ORDER BY at, id',
+          [response.id],
+        );
+        perQuestion = collapseEvents(events);
+
+        await client.query('DELETE FROM response_events WHERE response_id = $1', [response.id]);
+      }
+
+      // Timing accumulates across submissions. A participant who comes back to
+      // change an answer spends more time on the survey, and the first submit
+      // has already consumed its events - so overwriting here would report the
+      // second visit's total (often zero) as the whole duration.
+      for (const [questionId, value] of normalised) {
+        await client.query(
+          `INSERT INTO answers (response_id, question_id, value, time_ms)
+                VALUES ($1, $2, $3, $4)
+           ON CONFLICT (response_id, question_id) DO UPDATE
+                SET value = EXCLUDED.value,
+                    time_ms = CASE
+                      WHEN EXCLUDED.time_ms IS NULL THEN answers.time_ms
+                      ELSE COALESCE(answers.time_ms, 0) + EXCLUDED.time_ms
+                    END,
+                    updated_at = now()`,
+          [response.id, questionId, value, perQuestion.get(questionId) ?? null],
+        );
+      }
+
+      // Drop any stored answer for a now-hidden question, so a value entered
+      // before a conditional branch closed does not survive into the results.
+      const visibleIds = [...visible];
+      await client.query(
+        `DELETE FROM answers WHERE response_id = $1 AND NOT (question_id = ANY($2::uuid[]))`,
+        [response.id, visibleIds],
+      );
+
+      await client.query(
+        `UPDATE responses
+            SET status = 'completed',
+                completed_at = COALESCE(completed_at, now()),
+                updated_at = now(),
+                duration_ms = CASE
+                  WHEN $2::integer IS NULL THEN duration_ms
+                  ELSE COALESCE(duration_ms, 0) + $2::integer
+                END
+          WHERE id = $1`,
+        [response.id, survey.collect_timing ? totalDuration(perQuestion) : null],
+      );
+    });
+
+    // Response quota: close the survey once it reaches its target. Checked
+    // after the response is committed so the count includes it.
+    if (isPluginEnabled(current().plugins, PLUGINS.QUOTAS)) {
+      const { rows: sv } = await query('SELECT plugin_config FROM surveys WHERE id = $1', [
+        survey.id,
+      ]);
+      const max = sv[0]?.plugin_config?.quota?.maxResponses;
+      if (max) {
+        const { rows: counts } = await query(
+          `SELECT count(*)::int AS n FROM responses WHERE survey_id = $1 AND status = 'completed'`,
+          [survey.id],
+        );
+        if (counts[0].n >= Number(max)) {
+          await query(
+            `UPDATE surveys SET status = 'closed', closed_at = now(), updated_at = now()
+              WHERE id = $1 AND status = 'open'`,
+            [survey.id],
+          );
+        }
+      }
+    }
+
+    return res.json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+});

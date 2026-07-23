@@ -1,0 +1,9 @@
+# Local preview only. Disables Discord sign-in so the site can be clicked
+# through without a Discord application, and must never be used to deploy.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.preview.yml up -d --build
+services:
+  api:
+    environment:
+      NODE_ENV: development
+      DEV_AUTH_BYPASS: "1"
