@@ -22,7 +22,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Derive version and build metadata
         id: meta
@@ -30,10 +30,10 @@ jobs:
           echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -41,7 +41,7 @@ jobs:
 
       - name: Build and push the API image
         id: build_api
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./api
           push: true
@@ -55,7 +55,7 @@ jobs:
 
       - name: Build and push the web image
         id: build_web
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./web
           push: true
@@ -67,20 +67,20 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/quorum-web:latest
 
       - name: Attest API image provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ghcr.io/${{ github.repository_owner }}/quorum-api
           subject-digest: ${{ steps.build_api.outputs.digest }}
           push-to-registry: true
 
       - name: Attest web image provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ghcr.io/${{ github.repository_owner }}/quorum-web
           subject-digest: ${{ steps.build_web.outputs.digest }}
           push-to-registry: true
 
       - name: Create the GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
