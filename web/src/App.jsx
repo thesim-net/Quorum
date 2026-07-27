@@ -212,16 +212,46 @@ function ThemeControls({ onChange }) {
 /**
  * Site footer, shown on every screen including sign-in.
  *
+ * The commit link is transparency, not a tamper seal: it reports the commit the
+ * running build claims to be from and links to that exact source. The verifiable
+ * proof is the Sigstore provenance on the published image (see README); the
+ * tooltip carries the command to check it.
+ *
+ * @param {object} props
+ * @param {{version?: string, commit?: string, repo?: string}} props.build Build
+ *   metadata from /api/version.
  * @returns {JSX.Element} The footer.
  */
-function Footer({ version }) {
+function Footer({ build }) {
+  const { version, commit, repo } = build || {};
+  const shortSha = commit && commit !== 'unknown' ? commit.slice(0, 7) : '';
+  const owner = (repo || '').split('/')[0];
   return (
     <footer className="site-footer">
       <Link to="/privacy">Data privacy</Link>
       <span className="footer-sep" aria-hidden="true">
         ·
       </span>
-      Quorum{version ? ` v${version}` : ''} - Created by{' '}
+      Quorum{version ? ` v${version}` : ''}
+      {shortSha ? (
+        <>
+          {' · '}
+          <a
+            className="footer-commit"
+            href={`https://github.com/${repo}/commit/${commit}`}
+            target="_blank"
+            rel="noreferrer"
+            title={
+              `Built from commit ${commit}.\n` +
+              `Verify the published image yourself:\n` +
+              `gh attestation verify oci://ghcr.io/${owner}/quorum-api --repo ${repo}`
+            }
+          >
+            {shortSha}
+          </a>
+        </>
+      ) : null}
+      {' - Created by '}
       <a href="https://thomasloupe.com" target="_blank" rel="noreferrer">
         Thomas Loupe
       </a>
@@ -263,18 +293,18 @@ export function App() {
   const [user, setUser] = useState(undefined);
   const [devAuthBypass, setDevAuthBypass] = useState(false);
   const [setupState, setSetupState] = useState(null);
-  const [version, setVersion] = useState('');
+  const [build, setBuild] = useState({ version: '', commit: '', repo: '' });
 
   useEffect(() => {
     Promise.all([
       api('/auth/me').catch(() => ({ user: null })),
       api('/setup/state').catch(() => ({ configured: true })),
-      api('/version').catch(() => ({ version: '' })),
+      api('/version').catch(() => ({})),
     ]).then(([me, setup, ver]) => {
       setUser(me.user);
       setDevAuthBypass(!!me.devAuthBypass);
       setSetupState(setup);
-      setVersion(ver.version);
+      setBuild({ version: ver.version || '', commit: ver.commit || '', repo: ver.repo || '' });
 
       // Apply the skin saved to this account, so a returning admin sees their
       // choice on any device rather than whatever this browser last used.
@@ -300,7 +330,7 @@ export function App() {
     return (
       <>
         <Privacy />
-        <Footer version={version} />
+        <Footer build={build} />
       </>
     );
   }
@@ -320,7 +350,7 @@ export function App() {
             <Route path="*" element={<NeedsSetup error={setupState.error} />} />
           </Routes>
         </Suspense>
-        <Footer version={version} />
+        <Footer build={build} />
       </>
     );
   }
@@ -329,7 +359,7 @@ export function App() {
     return (
       <>
         <SignIn devAuthBypass={devAuthBypass} />
-        <Footer version={version} />
+        <Footer build={build} />
       </>
     );
   }
@@ -376,7 +406,7 @@ export function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </Suspense>
-      <Footer version={version} />
+      <Footer build={build} />
     </>
   );
 }

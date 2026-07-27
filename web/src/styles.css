@@ -519,6 +519,11 @@ label > span.field-label {
   color: var(--border);
 }
 
+/* The build commit: a monospace hash so it reads as a code identifier. */
+.footer-commit {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
 /* Long-form reading, for the privacy page. */
 .prose {
   max-width: 720px;

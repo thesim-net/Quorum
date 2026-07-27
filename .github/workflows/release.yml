@@ -8,9 +8,15 @@ on:
     tags:
       - 'v*'
 
+# id-token + attestations let the job sign a Sigstore build-provenance
+# statement for each published image, tying its digest to this repo, this
+# commit, and this workflow. Anyone can then verify a pulled image with
+# `gh attestation verify` (see README "Verifying a build").
 permissions:
   contents: write
   packages: write
+  id-token: write
+  attestations: write
 
 jobs:
   publish:
@@ -18,9 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Derive version from the tag
-        id: version
-        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Derive version and build metadata
+        id: meta
+        run: |
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -32,22 +40,45 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push the API image
+        id: build_api
         uses: docker/build-push-action@v6
         with:
           context: ./api
           push: true
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            VERSION=${{ steps.meta.outputs.version }}
+            BUILD_TIME=${{ steps.meta.outputs.build_time }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/quorum-api:${{ steps.version.outputs.value }}
+            ghcr.io/${{ github.repository_owner }}/quorum-api:${{ steps.meta.outputs.version }}
             ghcr.io/${{ github.repository_owner }}/quorum-api:latest
 
       - name: Build and push the web image
+        id: build_web
         uses: docker/build-push-action@v6
         with:
           context: ./web
           push: true
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            VERSION=${{ steps.meta.outputs.version }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/quorum-web:${{ steps.version.outputs.value }}
+            ghcr.io/${{ github.repository_owner }}/quorum-web:${{ steps.meta.outputs.version }}
             ghcr.io/${{ github.repository_owner }}/quorum-web:latest
+
+      - name: Attest API image provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/quorum-api
+          subject-digest: ${{ steps.build_api.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest web image provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/quorum-web
+          subject-digest: ${{ steps.build_web.outputs.digest }}
+          push-to-registry: true
 
       - name: Create the GitHub Release
         uses: softprops/action-gh-release@v2

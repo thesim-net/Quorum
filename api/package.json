@@ -1,7 +1,8 @@
 {
   "name": "quorum-api",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
+  "license": "SEE LICENSE IN LICENSE.md",
   "type": "module",
   "engines": {
     "node": ">=22"

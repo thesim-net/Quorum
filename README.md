@@ -33,6 +33,19 @@ The admin page shows a banner when a newer version is published. To update, run 
 
 Releases are published to GHCR by a GitHub Action on each `v*` tag. To cut one: bump the version in `api/package.json` and `web/package.json`, then `git tag v1.2.3 && git push --tags`.
 
+## Verifying a build
+
+The footer shows the exact commit a build was compiled from, linked to its source. That is transparency, not a tamper seal: a server draws its own footer, so it can only report what it claims to be.
+
+The verifiable proof is on the published image. Each release carries a [Sigstore build-provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds) binding the image digest to this repo, this commit, and the workflow that built it. Anyone can check it:
+
+```
+gh attestation verify oci://ghcr.io/thomasloupe/quorum-api:1.0.1 --repo thomasloupe/Quorum
+gh attestation verify oci://ghcr.io/thomasloupe/quorum-web:1.0.1 --repo thomasloupe/Quorum
+```
+
+A pass proves the image was built by this repo's release workflow from that commit, not hand-built or swapped. It attests the published artifact, not any one operator's live container: an operator controls their own server, so no rendered badge can prove a running site is untampered. The guarantee lives on the image you pull, before it ever runs.
+
 ## Privacy model
 
 - **Respondent identity is pseudonymous by default.** Each response stores `HMAC(per-survey key, pepper + discord_id)`, never the raw id, unless the survey has "record username" enabled. The key is per survey, so responses cannot be correlated across surveys.
@@ -88,3 +101,7 @@ Covers Discord permission resolution, answer validation, response timing, result
 Discord has no "who is in a channel" endpoint. The channel gate resolves a member's roles against the channel's permission overwrites, reproducing Discord's own calculation, including administrator bypass, owner bypass, member-specific overwrites, and thread inheritance.
 
 `docker-compose.preview.yml` is a local-development convenience that bypasses Discord sign-in. It only activates under `NODE_ENV=development` and the process refuses to start if that flag is set with any other environment, so it can never be enabled by accident on a real deployment.
+
+## License
+
+Source-available under the [PolyForm Perimeter License 1.0.0](LICENSE.md). Use, modify, and self-host Quorum for any purpose, including running a business on it, free of charge. You may not resell, repackage, or offer it as a product or hosted service that competes with Quorum.
