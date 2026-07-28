@@ -11,9 +11,11 @@ import { authRouter } from './routes/auth.js';
 import { setupRouter } from './routes/setup.js';
 import { surveyRouter } from './routes/surveys.js';
 import { loadSession } from './middleware/session.js';
-import { ensureSetupTokenIfNeeded, loadSettings } from './lib/settings.js';
+import { ensureSetupTokenIfNeeded, loadSettings, current } from './lib/settings.js';
 import { startScheduler } from './lib/scheduler.js';
 import { VERSION, GIT_SHA, BUILD_TIME, REPO } from './lib/version.js';
+import { attestationStatus } from './lib/attestation.js';
+import { classifyPlugins } from './lib/plugins.js';
 
 const app = express();
 
@@ -30,6 +32,20 @@ app.get('/api/health', (_req, res) => res.json({ ok: true, version: VERSION, com
 app.get('/api/version', (_req, res) =>
   res.json({ version: VERSION, commit: GIT_SHA, buildTime: BUILD_TIME, repo: REPO }),
 );
+
+// Public build-verification status: whether the running image's provenance is
+// signed, plus which plugins are active. Enabled plugins are reported so the
+// page can disclose any custom (unlisted) one; they never change the verdict.
+app.get('/api/attestation', async (req, res) => {
+  const status = await attestationStatus(req.query.refresh === '1');
+  let plugins = { official: [], custom: [] };
+  try {
+    plugins = classifyPlugins(current().plugins);
+  } catch {
+    // Settings not loaded yet (pre-boot request); report no plugins.
+  }
+  res.json({ ...status, plugins });
+});
 
 app.use(
   '/api/auth',

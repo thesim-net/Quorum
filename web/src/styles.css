@@ -524,6 +524,74 @@ label > span.field-label {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
+/* Footer verification pill. Glyph plus label carry the state, never colour
+   alone, so it stays legible without colour vision. */
+.verify-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.05rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 0.8rem;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.verify-badge.verify-ok {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+.verify-badge.verify-warn {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+.verify-badge.verify-muted {
+  color: var(--text-muted);
+}
+
+/* Verification page status banner. */
+.verify-status {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: 8px;
+  margin: 1rem 0 1.5rem;
+}
+.verify-status p {
+  margin: 0.35rem 0 0;
+}
+.verify-status.verify-ok {
+  border-left-color: var(--ok);
+}
+.verify-status.verify-ok .verify-glyph {
+  color: var(--ok);
+}
+.verify-status.verify-warn {
+  border-left-color: var(--danger);
+}
+.verify-status.verify-warn .verify-glyph {
+  color: var(--danger);
+}
+.verify-status.verify-muted .verify-glyph {
+  color: var(--text-muted);
+}
+.verify-glyph {
+  font-size: 1.5rem;
+  line-height: 1.4;
+}
+.verify-digest {
+  word-break: break-all;
+}
+.verify-actions {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
 /* Long-form reading, for the privacy page. */
 .prose {
   max-width: 720px;

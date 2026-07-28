@@ -72,3 +72,28 @@ export function sanitisePlugins(input) {
   }
   return out;
 }
+
+/**
+ * Splits an enablement map into official (catalogued) and custom (unlisted)
+ * plugins, for the build-verification page.
+ *
+ * Enabling an official plugin is pure configuration stored in the database; it
+ * never changes the image bytes, so it cannot affect the build attestation. A
+ * plugin key that is not in the catalogue is code outside the published image,
+ * so it is disclosed by name rather than silently folded into the verified
+ * build.
+ *
+ * @param {object} plugins The app_settings.plugins map.
+ * @returns {{official: {key: string, name: string}[], custom: string[]}}
+ */
+export function classifyPlugins(plugins) {
+  const official = [];
+  const custom = [];
+  for (const [key, enabled] of Object.entries(plugins ?? {})) {
+    if (!enabled) continue;
+    const meta = PLUGIN_CATALOGUE.find((plugin) => plugin.key === key);
+    if (meta) official.push({ key, name: meta.name });
+    else custom.push(key);
+  }
+  return { official, custom };
+}

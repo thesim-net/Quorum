@@ -5,6 +5,7 @@ import { useTheme } from './theme.jsx';
 import { Home } from './pages/Home.jsx';
 import { TakeSurvey } from './pages/TakeSurvey.jsx';
 import { Privacy } from './pages/Privacy.jsx';
+import { Verify } from './pages/Verify.jsx';
 
 // The admin panel pulls in the charting library, which participants never need.
 // Loading it lazily keeps the bundle a survey-taker downloads small.
@@ -210,25 +211,46 @@ function ThemeControls({ onChange }) {
 }
 
 /**
+ * Verification pill shown in the footer.
+ *
+ * Glyph plus label, never colour alone, so the state is legible without colour
+ * vision. It links to the full /verify page rather than asserting proof on its
+ * own: the badge is the running server's self-report, and the page is candid
+ * about what that is worth versus the independent check.
+ */
+const VERIFY_BADGE = {
+  verified: { cls: 'ok', glyph: '✓', label: 'Verified build' },
+  unverified: { cls: 'warn', glyph: '⚠', label: 'Unverified build' },
+  local: { cls: 'muted', glyph: '•', label: 'Local build' },
+  unknown: { cls: 'muted', glyph: '•', label: 'Verify build' },
+};
+
+/**
  * Site footer, shown on every screen including sign-in.
  *
- * The commit link is transparency, not a tamper seal: it reports the commit the
- * running build claims to be from and links to that exact source. The verifiable
- * proof is the Sigstore provenance on the published image (see README); the
- * tooltip carries the command to check it.
+ * The commit link reports the commit the running build claims to be from; the
+ * verification pill links to /verify, which resolves the running image against
+ * its published provenance and hands out the independent check.
  *
  * @param {object} props
  * @param {{version?: string, commit?: string, repo?: string}} props.build Build
  *   metadata from /api/version.
+ * @param {string} [props.attestState] Attestation state from /api/attestation.
  * @returns {JSX.Element} The footer.
  */
-function Footer({ build }) {
+function Footer({ build, attestState }) {
   const { version, commit, repo } = build || {};
   const shortSha = commit && commit !== 'unknown' ? commit.slice(0, 7) : '';
-  const owner = (repo || '').split('/')[0];
+  const badge = VERIFY_BADGE[attestState] ?? VERIFY_BADGE.unknown;
   return (
     <footer className="site-footer">
       <Link to="/privacy">Data privacy</Link>
+      <span className="footer-sep" aria-hidden="true">
+        ·
+      </span>
+      <Link to="/verify" className={`verify-badge verify-${badge.cls}`}>
+        <span aria-hidden="true">{badge.glyph}</span> {badge.label}
+      </Link>
       <span className="footer-sep" aria-hidden="true">
         ·
       </span>
@@ -241,11 +263,6 @@ function Footer({ build }) {
             href={`https://github.com/${repo}/commit/${commit}`}
             target="_blank"
             rel="noreferrer"
-            title={
-              `Built from commit ${commit}.\n` +
-              `Verify the published image yourself:\n` +
-              `gh attestation verify oci://ghcr.io/${owner}/quorum-api --repo ${repo}`
-            }
           >
             {shortSha}
           </a>
@@ -294,6 +311,7 @@ export function App() {
   const [devAuthBypass, setDevAuthBypass] = useState(false);
   const [setupState, setSetupState] = useState(null);
   const [build, setBuild] = useState({ version: '', commit: '', repo: '' });
+  const [attestState, setAttestState] = useState(undefined);
 
   useEffect(() => {
     Promise.all([
@@ -311,6 +329,13 @@ export function App() {
       if (me.user?.theme?.skin) setSkin(me.user.theme.skin);
       if (me.user?.theme?.mode) applyMode(me.user.theme.mode);
     });
+
+    // The attestation check reaches out to GHCR and GitHub, so it is fetched
+    // on its own rather than gating the app render behind it. The footer badge
+    // simply appears once it resolves.
+    api('/attestation')
+      .then((a) => setAttestState(a.state))
+      .catch(() => setAttestState('unknown'));
   }, [setSkin, applyMode]);
 
   /**
@@ -330,7 +355,18 @@ export function App() {
     return (
       <>
         <Privacy />
-        <Footer build={build} />
+        <Footer build={build} attestState={attestState} />
+      </>
+    );
+  }
+
+  // Build verification is public too: anyone should be able to check what this
+  // deployment is running, signed in or not, configured or not.
+  if (location.pathname === '/verify') {
+    return (
+      <>
+        <Verify />
+        <Footer build={build} attestState={attestState} />
       </>
     );
   }
@@ -350,7 +386,7 @@ export function App() {
             <Route path="*" element={<NeedsSetup error={setupState.error} />} />
           </Routes>
         </Suspense>
-        <Footer build={build} />
+        <Footer build={build} attestState={attestState} />
       </>
     );
   }
@@ -359,7 +395,7 @@ export function App() {
     return (
       <>
         <SignIn devAuthBypass={devAuthBypass} />
-        <Footer build={build} />
+        <Footer build={build} attestState={attestState} />
       </>
     );
   }
@@ -406,7 +442,7 @@ export function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </Suspense>
-      <Footer build={build} />
+      <Footer build={build} attestState={attestState} />
     </>
   );
 }

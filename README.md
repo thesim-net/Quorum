@@ -37,11 +37,13 @@ Releases are published to GHCR by a GitHub Action on each `v*` tag. To cut one: 
 
 The footer shows the exact commit a build was compiled from, linked to its source. That is transparency, not a tamper seal: a server draws its own footer, so it can only report what it claims to be.
 
-The verifiable proof is on the published image. Each release carries a [Sigstore build-provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds) binding the image digest to this repo, this commit, and the workflow that built it. Anyone can check it:
+Every page has a footer badge linking to a **`/verify`** page. The running server resolves its own published image and reports whether its provenance is signed, and the page hands out the exact command to check it independently (a "Copy Attestation" button copies both). Enabled plugins are listed there too; a built-in plugin is database config and never affects the verdict, while any custom (unlisted) plugin is disclosed as outside the verified build. That in-app result is the server reporting on itself, which is an honest signal for a deployment you trust but not proof for one you do not.
+
+The verifiable proof is on the published image. Each release carries a [Sigstore build-provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds) binding the image digest to this repo, this commit, and the workflow that built it. Anyone can check it, no GitHub account needed:
 
 ```
-gh attestation verify oci://ghcr.io/thomasloupe/quorum-api:1.0.1 --repo thomasloupe/Quorum
-gh attestation verify oci://ghcr.io/thomasloupe/quorum-web:1.0.1 --repo thomasloupe/Quorum
+gh attestation verify oci://ghcr.io/thomasloupe/quorum-api:1.0.2 --repo thomasloupe/Quorum
+gh attestation verify oci://ghcr.io/thomasloupe/quorum-web:1.0.2 --repo thomasloupe/Quorum
 ```
 
 A pass proves the image was built by this repo's release workflow from that commit, not hand-built or swapped. It attests the published artifact, not any one operator's live container: an operator controls their own server, so no rendered badge can prove a running site is untampered. The guarantee lives on the image you pull, before it ever runs.
