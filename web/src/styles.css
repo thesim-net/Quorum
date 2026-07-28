@@ -591,6 +591,11 @@ label > span.field-label {
   align-items: center;
   flex-wrap: wrap;
 }
+.verify-cmd-label {
+  margin: 0.75rem 0 0.25rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
 
 /* Long-form reading, for the privacy page. */
 .prose {

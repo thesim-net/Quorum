@@ -74,7 +74,8 @@ export function Verify() {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      setError(true);
+      // Clipboard denied or unavailable. The commands are shown above to copy
+      // by hand, so a failure here must not disturb the loaded page.
     }
   };
 
@@ -145,9 +146,16 @@ export function Verify() {
         deployment you already trust, and it will flag an unofficial or drifted image. It is not
         proof for a deployment you do not control, because the same server draws this page. The real
         proof is the command below, run on your own machine against the published image, before this
-        server is ever involved.
+        server is ever involved. Quorum ships as two images, so there are two commands: one for the
+        backend, one for the frontend served to browsers.
+      </p>
+      <p className="verify-cmd-label">
+        Backend (<code>quorum-api</code>):
       </p>
       <pre className="codeblock">{status.verify.api}</pre>
+      <p className="verify-cmd-label">
+        Frontend (<code>quorum-web</code>):
+      </p>
       <pre className="codeblock">{status.verify.web}</pre>
       <p className="verify-actions">
         <button type="button" onClick={copy}>
