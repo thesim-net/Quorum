@@ -21,6 +21,11 @@ test('the intent survives a round trip through the state parameter', () => {
   });
 });
 
+test('the respondent intent round trips like the others', () => {
+  const state = encodeState(INTENTS.RESPONDENT, 'tok');
+  assert.deepEqual(decodeState(state), { intent: INTENTS.RESPONDENT, token: 'tok' });
+});
+
 test('an unknown intent is never encoded, and never decoded', () => {
   assert.equal(decodeState(encodeState('elevate', 'tok')).intent, INTENTS.SIGN_IN);
   assert.equal(decodeState('elevate.tok'), null);
@@ -76,6 +81,22 @@ test('a link with nobody signed in creates nothing and switches to nobody', () =
   });
   assert.equal(outcome.action, CALLBACK_ACTIONS.LINK_SIGNED_OUT);
   assert.equal(outcome.userId, null);
+});
+
+test('taking a survey resolves to an identity and never to an account', () => {
+  // Whoever holds the id, and whether they are signed in here, is beside the
+  // point: a respondent is not an account, and none is created, found, or
+  // switched to.
+  for (const context of [
+    { existingUserId: null },
+    { existingUserId: OTHER },
+    { signedInUserId: OWNER, existingUserId: OWNER },
+    { existingUserId: null, isBootstrapAdmin: true },
+  ]) {
+    const outcome = resolveCallback({ intent: INTENTS.RESPONDENT, ...context });
+    assert.equal(outcome.action, CALLBACK_ACTIONS.RESPONDENT);
+    assert.equal(outcome.userId, null);
+  }
 });
 
 test('a free Discord id is attached to the caller', () => {

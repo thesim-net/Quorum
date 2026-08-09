@@ -43,6 +43,7 @@ import {
 } from '../lib/groups.js';
 import { groupsRouter } from './groups.js';
 import { postMessage } from '../plugins/discord/discord.js';
+import { cachedGuildName } from '../plugins/discord/gate.js';
 import { adminDirectory, hasBootstrapSupers } from '../plugins/discord/session.js';
 
 export const adminRouter = Router();
@@ -221,7 +222,7 @@ function slugify(title) {
  */
 async function pluginUsage() {
   const { rows } = await query(
-    `SELECT s.id, s.title, s.plugin_config, s.gate_role_ids, s.gate_channel_ids,
+    `SELECT s.id, s.title, s.plugin_config, s.require_guild,
             EXISTS (SELECT 1 FROM questions q WHERE q.survey_id = s.id AND q.config ? 'showIf')
               AS has_conditional
        FROM surveys s
@@ -242,10 +243,11 @@ async function pluginUsage() {
     const config = row.plugin_config ?? {};
     const entry = { id: row.id, title: row.title };
 
-    // A survey gated by role or channel needs Discord to evaluate the gate.
-    if (row.gate_role_ids.length > 0 || row.gate_channel_ids.length > 0) {
-      usage[PLUGINS.DISCORD].push(entry);
-    }
+    // A survey gated on the guild needs Discord to let anybody in at all;
+    // disabling the plugin under it would close it to everyone rather than
+    // opening it to all. Role and channel lists alone are inert while the guild
+    // checkbox is off, so they no longer count as a dependency on their own.
+    if (row.require_guild) usage[PLUGINS.DISCORD].push(entry);
     if (config.announceChannelId) usage[PLUGINS.ANNOUNCEMENTS].push(entry);
     if (config.remindHoursBeforeClose !== undefined && config.remindHoursBeforeClose !== null) {
       usage[PLUGINS.REMINDERS].push(entry);
@@ -716,7 +718,7 @@ adminRouter.get('/surveys', async (req, res, next) => {
       `SELECT s.id, s.slug, s.title, s.status, s.created_at, s.closes_at,
               s.opens_at, s.group_id, gr.name AS group_name,
               s.collect_timing, s.collect_location, s.collect_identity,
-              s.allow_response_edits, s.gate_role_ids, s.gate_channel_ids,
+              s.allow_response_edits, s.one_response_per_person, s.require_guild,
               -- Both joins fan out, so every count here must be DISTINCT or the
               -- two tables multiply each other's rows.
               count(DISTINCT q.id)                                       AS question_count,
@@ -754,7 +756,7 @@ adminRouter.get('/surveys', async (req, res, next) => {
           opensAt: row.opens_at,
           closesAt: row.closes_at,
           state: liveState(row),
-          gated: row.gate_role_ids.length > 0 || row.gate_channel_ids.length > 0,
+          gated: row.require_guild,
           questionCount: Number(row.question_count),
           started: Number(row.started),
           completed: Number(row.completed),
@@ -767,6 +769,7 @@ adminRouter.get('/surveys', async (req, res, next) => {
             identity: row.collect_identity,
           },
           allowsEdits: row.allow_response_edits,
+          oneResponsePerPerson: row.one_response_per_person,
         })),
     });
   } catch (error) {
@@ -846,14 +849,23 @@ adminRouter.get('/surveys/:id', writeSurveys, async (req, res, next) => {
         opensAt: survey.opens_at,
         closesAt: survey.closes_at,
         allowResponseEdits: survey.allow_response_edits,
+        oneResponsePerPerson: survey.one_response_per_person,
         collectTiming: survey.collect_timing,
         collectLocation: survey.collect_location,
         collectIdentity: survey.collect_identity,
+        requireGuild: survey.require_guild,
         gateRoleIds: survey.gate_role_ids,
         gateChannelIds: survey.gate_channel_ids,
         pluginConfig: survey.plugin_config ?? {},
       },
       plugins: current().plugins ?? {},
+      // Whether the guild checkbox can be offered at all, and what to call the
+      // server on its label. The name is whatever is already known; the editor
+      // falls back to generic wording rather than waiting on Discord for it.
+      discord: {
+        ready: discordActive(),
+        guildName: discordActive() ? current().discord.guildName ?? cachedGuildName() : null,
+      },
       questions: questions.map((q) => ({
         id: q.id,
         position: q.position,
@@ -910,9 +922,11 @@ const EDITABLE = {
   opensAt: 'opens_at',
   closesAt: 'closes_at',
   allowResponseEdits: 'allow_response_edits',
+  oneResponsePerPerson: 'one_response_per_person',
   collectTiming: 'collect_timing',
   collectLocation: 'collect_location',
   collectIdentity: 'collect_identity',
+  requireGuild: 'require_guild',
   gateRoleIds: 'gate_role_ids',
   gateChannelIds: 'gate_channel_ids',
   pluginConfig: 'plugin_config',
@@ -923,6 +937,9 @@ const EDITABLE = {
  *
  * Turning `collectIdentity` off also erases the identities already recorded,
  * so the toggle means the same thing retroactively as it does going forward.
+ * Turning `oneResponsePerPerson` on or off rewrites the flag its responses
+ * carry, for the same reason: the setting has to mean what it says about the
+ * responses already in hand, not only the next one.
  */
 adminRouter.patch('/surveys/:id', writeSurveys, async (req, res, next) => {
   try {
@@ -932,6 +949,22 @@ adminRouter.patch('/surveys/:id', writeSurveys, async (req, res, next) => {
     if ('pluginConfig' in req.body) {
       const problem = validatePluginConfig(req.body.pluginConfig);
       if (problem) return res.status(400).json({ error: problem });
+    }
+
+    // A survey cannot be newly tied to a Discord server this deployment has not
+    // connected: it would publish as gated and then refuse everybody. Only the
+    // change is refused, never a save that happens to carry the flag along, or
+    // an already-gated survey could not be edited - including to turn the flag
+    // back off - once its server went away.
+    if (req.body.requireGuild === true && !discordActive()) {
+      const { rows } = await query('SELECT require_guild FROM surveys WHERE id = $1', [
+        req.params.id,
+      ]);
+      if (rows.length > 0 && !rows[0].require_guild) {
+        return res.status(409).json({
+          error: 'Connect a Discord server before limiting a survey to its members.',
+        });
+      }
     }
 
     const sets = [];
@@ -944,16 +977,47 @@ adminRouter.patch('/surveys/:id', writeSurveys, async (req, res, next) => {
     }
     if (sets.length === 0) return res.status(400).json({ error: 'Nothing to update.' });
 
-    const { rows } = await query(
-      `UPDATE surveys SET ${sets.join(', ')}, updated_at = now()
-        WHERE id = $1 RETURNING id, collect_identity`,
-      values,
-    );
-    if (rows.length === 0) return res.status(404).json({ error: 'Survey not found.' });
+    let updated;
+    try {
+      updated = await transaction(async (client) => {
+        const { rows } = await client.query(
+          `UPDATE surveys SET ${sets.join(', ')}, updated_at = now()
+            WHERE id = $1 RETURNING id, collect_identity`,
+          values,
+        );
+        if (rows.length === 0) return null;
 
-    if (req.body.collectIdentity === false) {
-      await query('UPDATE responses SET user_id = NULL WHERE survey_id = $1', [req.params.id]);
+        // Each response carries a copy of the survey's one-per-person setting,
+        // because that is the only way a partial unique index can enforce it.
+        // Rewriting them here is what keeps the copy honest - and turning the
+        // setting on when the same person has already answered twice fails on
+        // the index, which is exactly the answer the admin needs.
+        if ('oneResponsePerPerson' in req.body) {
+          await client.query('UPDATE responses SET exclusive = $2 WHERE survey_id = $1', [
+            req.params.id,
+            Boolean(req.body.oneResponsePerPerson),
+          ]);
+        }
+
+        if (req.body.collectIdentity === false) {
+          await client.query('UPDATE responses SET user_id = NULL WHERE survey_id = $1', [
+            req.params.id,
+          ]);
+        }
+
+        return rows[0];
+      });
+    } catch (error) {
+      if (error?.code === '23505') {
+        return res.status(409).json({
+          error:
+            'This survey already holds more than one response from the same person, so it cannot ' +
+            'be limited to one response each. Remove the extra responses first.',
+        });
+      }
+      throw error;
     }
+    if (!updated) return res.status(404).json({ error: 'Survey not found.' });
 
     await audit(req.user.id, 'survey.update', 'survey', req.params.id, {
       fields: Object.keys(req.body),
@@ -973,7 +1037,7 @@ adminRouter.post('/surveys/:id/status', publishSurveys, async (req, res, next) =
     }
 
     const { rows: existing } = await query(
-      'SELECT opens_at, closes_at FROM surveys WHERE id = $1',
+      'SELECT opens_at, closes_at, require_guild FROM surveys WHERE id = $1',
       [req.params.id],
     );
     if (existing.length === 0) return res.status(404).json({ error: 'Survey not found.' });
@@ -985,6 +1049,17 @@ adminRouter.post('/surveys/:id/status', publishSurveys, async (req, res, next) =
       );
       if (rows[0].n === 0) {
         return res.status(400).json({ error: 'Add at least one question before opening.' });
+      }
+
+      // A gated survey fails closed when Discord is not there to check the
+      // server, so opening one in that state would publish a survey nobody can
+      // take. Said here rather than discovered by its participants.
+      if (existing[0].require_guild && !discordActive()) {
+        return res.status(409).json({
+          error:
+            'This survey is limited to members of a Discord server, and no server is connected. ' +
+            'Connect one, or turn that limit off, before opening it.',
+        });
       }
     }
 

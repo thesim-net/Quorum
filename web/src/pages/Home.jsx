@@ -32,7 +32,7 @@ function CollectionBadges({ disclosures }) {
  * Lists the open surveys.
  *
  * No sign-in is needed: anyone with the link can browse and take open surveys.
- * A survey restricted to Discord roles or channels is still listed, with a
+ * A survey limited to the members of a Discord server is still listed, with a
  * sign-in prompt in place of its start button.
  *
  * @returns {JSX.Element} The page.
@@ -74,7 +74,9 @@ export function Home() {
               <h2 style={{ margin: 0 }}>{survey.title}</h2>
               {survey.myStatus === 'completed' ? <span className="badge">Completed</span> : null}
               {survey.myStatus === 'in_progress' ? <span className="badge">In progress</span> : null}
-              {survey.requiresDiscord ? <span className="badge">Discord members only</span> : null}
+              {survey.requiresDiscord ? (
+                <span className="badge">{survey.guild ? `${survey.guild} members only` : 'Discord members only'}</span>
+              ) : null}
             </div>
 
             {survey.description ? <p>{survey.description}</p> : null}
@@ -85,15 +87,19 @@ export function Home() {
 
             <p style={{ marginTop: '0.9rem' }}>
               {survey.requiresDiscord ? (
-                <a className="button primary" href="/api/auth/discord/login">
-                  Sign in with Discord to take this survey
+                // Not the admin sign-in: taking a survey proves an identity and
+                // creates no account.
+                <a className="button primary" href={`/api/auth/discord/respond?slug=${survey.slug}`}>
+                  Continue with Discord to take this survey
                 </a>
               ) : (
                 <Link className="button primary" to={`/s/${survey.slug}`}>
                   {survey.myStatus === 'completed'
                     ? survey.allowsEdits
                       ? 'Change my answers'
-                      : 'View'
+                      : survey.allowsRepeat
+                        ? 'Answer again'
+                        : 'View'
                     : survey.myStatus === 'in_progress'
                       ? 'Resume'
                       : 'Take survey'}

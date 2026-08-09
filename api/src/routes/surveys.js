@@ -6,7 +6,14 @@ import { visibleQuestions } from '../lib/conditional.js';
 import { PLUGINS, isPluginEnabled } from '../lib/plugins.js';
 import { current } from '../lib/settings.js';
 import { countryOf } from '../lib/geo.js';
-import { respondentHash } from '../lib/respondent.js';
+import { respondentHash, respondentIdentity } from '../lib/respondent.js';
+import {
+  START,
+  allowsRepeat,
+  currentAttempt,
+  oneResponsePerPerson,
+  startAction,
+} from '../lib/responsePolicy.js';
 import { collapseEvents, totalDuration } from '../lib/timing.js';
 import {
   HARD_MAX_BYTES,
@@ -17,7 +24,8 @@ import {
   validateUpload,
 } from '../lib/uploads.js';
 import { ensureRespondent } from '../middleware/respondent.js';
-import { evaluateGate } from '../plugins/discord/gate.js';
+import { cachedGuildName, channelVisibleTo, guildMembership } from '../plugins/discord/gate.js';
+import { ACCESS, refusal, resolveAccess } from '../plugins/discord/guildGate.js';
 
 export const surveyRouter = Router();
 
@@ -64,81 +72,108 @@ const disclosures = (survey) => ({
 });
 
 /**
+ * The Discord identity behind this request, if there is one.
+ *
+ * A respondent proves one through the survey sign-in; an admin already carries
+ * theirs in the session, so a gated survey never sends them back round a trip
+ * they have effectively already made.
+ *
+ * @param {import('express').Request} req
+ * @returns {string|null} A Discord user id, or null.
+ */
+const discordIdOf = (req) => req.user?.discordId ?? req.respondentDiscordId ?? null;
+
+/** The connected server's name for participant copy, at no cost to the request. */
+const guildName = () => current().discord.guildName ?? cachedGuildName();
+
+/**
  * Decides whether the caller may open a survey.
  *
- * An ungated survey is open to anyone. A survey gated by Discord role or
- * channel needs the discord plugin and a Discord sign-in before the gate
- * itself is even evaluated; each refusal carries a code the client can act on.
+ * The policy itself is in `guildGate.js`; this supplies the Discord lookups it
+ * runs on. An anonymous survey never reaches them - that is what "truly
+ * anonymous" means here, and it is why a Discord outage cannot touch one.
  *
  * @param {object} survey Survey row.
- * @param {object|null} user Signed-in account from `req.user`, if any.
+ * @param {import('express').Request} req The request, for its identities.
  * @returns {Promise<{allowed: boolean, status?: number, code?: string,
- *   reason?: string}>} Verdict, with a participant-safe reason when refused.
+ *   reason?: string, guild?: string|null}>} Verdict, with a participant-safe
+ *   reason when refused.
  */
-async function surveyAccess(survey, user) {
-  const gated =
-    (survey.gate_role_ids?.length ?? 0) > 0 || (survey.gate_channel_ids?.length ?? 0) > 0;
-  if (!gated) return { allowed: true };
-
+async function surveyAccess(survey, req) {
   const settings = current();
-  if (!isPluginEnabled(settings.plugins, PLUGINS.DISCORD) || !settings.discord.configured) {
-    return {
-      allowed: false,
-      status: 403,
-      code: 'discord_disabled',
-      reason:
-        'This survey is limited by Discord role or channel, and Discord is not enabled on this deployment.',
-    };
-  }
-  if (!user?.discordId) {
-    return {
-      allowed: false,
-      status: 403,
-      code: 'discord_login_required',
-      reason: 'This survey requires signing in with Discord.',
-    };
-  }
 
-  const gate = await evaluateGate(survey, user);
-  if (!gate.allowed) return { allowed: false, status: 403, reason: gate.reason };
-  return { allowed: true };
+  const outcome = await resolveAccess(
+    {
+      survey,
+      pluginReady:
+        isPluginEnabled(settings.plugins, PLUGINS.DISCORD) && settings.discord.configured,
+      discordId: discordIdOf(req),
+    },
+    { member: guildMembership, canSeeChannel: channelVisibleTo },
+  );
+
+  if (outcome === ACCESS.OPEN) return { allowed: true };
+  return { allowed: false, ...refusal(outcome, guildName()) };
 }
 
 /**
  * Loads a survey by slug and confirms the caller may see it.
  *
  * @param {string} slug Survey slug.
- * @param {object|null} user Signed-in account from `req.user`, if any.
+ * @param {import('express').Request} req The request, for its identities.
  * @returns {Promise<{survey: object}|{error: string, status: number, code?: string}>}
  *   The survey, or a refusal with the status to send.
  */
-async function loadAccessibleSurvey(slug, user) {
+async function loadAccessibleSurvey(slug, req) {
   const { rows } = await query('SELECT * FROM surveys WHERE slug = $1', [slug]);
   if (rows.length === 0) return { error: 'Survey not found.', status: 404 };
 
   const survey = rows[0];
   if (survey.status === 'draft') return { error: 'Survey not found.', status: 404 };
 
-  const access = await surveyAccess(survey, user);
-  if (!access.allowed) return { error: access.reason, status: access.status, code: access.code };
+  const access = await surveyAccess(survey, req);
+  if (!access.allowed) {
+    return { error: access.reason, status: access.status, code: access.code, guild: access.guild };
+  }
 
   return { survey };
 }
 
 /**
- * Finds the caller's response to a survey, if any.
+ * Which id this survey counts the caller by.
+ *
+ * A gated survey counts Discord accounts, an anonymous one counts browsers.
+ * Resolved per survey rather than per request, because one browser can hold
+ * both at once.
+ *
+ * @param {object} survey Survey row.
+ * @param {import('express').Request} req
+ * @returns {string|null} The opaque id to hash, or null when a gated survey has
+ *   no verified Discord identity behind it.
+ */
+const identityFor = (survey, req) =>
+  respondentIdentity(survey, { cookieId: req.respondentId, discordId: discordIdOf(req) });
+
+/**
+ * Finds the response the caller is currently working on, if any.
+ *
+ * A survey that allows repeats can hold several under one respondent hash, so
+ * every row is read and `currentAttempt` picks between them rather than the
+ * query trusting that there is only ever one.
  *
  * @param {object} survey Survey row, for its respondent key.
- * @param {string} respondentId The caller's anonymous respondent id.
+ * @param {string|null} respondentId The caller's opaque respondent id.
  * @returns {Promise<object|null>} Response row, or null.
  */
 async function findOwnResponse(survey, respondentId) {
+  if (!respondentId) return null;
+
   const hash = respondentHash(survey.respondent_key, respondentId);
   const { rows } = await query(
     'SELECT * FROM responses WHERE survey_id = $1 AND respondent_hash = $2',
     [survey.id, hash],
   );
-  return rows[0] ?? null;
+  return currentAttempt(rows);
 }
 
 /** Lists every open survey the caller can access. */
@@ -154,14 +189,14 @@ surveyRouter.get('/', async (req, res, next) => {
 
     const visible = [];
     for (const survey of rows) {
-      const access = await surveyAccess(survey, req.user);
+      const access = await surveyAccess(survey, req);
 
       // A gated survey is still listed for someone who has not signed in with
       // Discord yet, flagged so the client can say what it needs. Everything
       // else refused stays invisible.
-      if (!access.allowed && access.code !== 'discord_login_required') continue;
+      if (!access.allowed && access.code !== ACCESS.SIGN_IN_REQUIRED) continue;
 
-      const own = access.allowed ? await findOwnResponse(survey, req.respondentId) : null;
+      const own = access.allowed ? await findOwnResponse(survey, identityFor(survey, req)) : null;
       visible.push({
         slug: survey.slug,
         title: survey.title,
@@ -169,7 +204,9 @@ surveyRouter.get('/', async (req, res, next) => {
         closesAt: survey.closes_at,
         disclosures: disclosures(survey),
         allowsEdits: survey.allow_response_edits,
+        allowsRepeat: allowsRepeat(survey),
         requiresDiscord: !access.allowed,
+        guild: access.allowed ? null : access.guild,
         myStatus: own?.status ?? null,
       });
     }
@@ -188,11 +225,15 @@ surveyRouter.get('/', async (req, res, next) => {
  */
 surveyRouter.get('/:slug', async (req, res, next) => {
   try {
-    const result = await loadAccessibleSurvey(req.params.slug, req.user);
-    if (result.error) return res.status(result.status).json({ error: result.error, code: result.code });
+    const result = await loadAccessibleSurvey(req.params.slug, req);
+    if (result.error) {
+      return res
+        .status(result.status)
+        .json({ error: result.error, code: result.code, guild: result.guild });
+    }
 
     const { survey } = result;
-    const own = await findOwnResponse(survey, req.respondentId);
+    const own = await findOwnResponse(survey, identityFor(survey, req));
 
     const { rows: counts } = await query(
       'SELECT count(*)::int AS n FROM questions WHERE survey_id = $1',
@@ -210,6 +251,7 @@ surveyRouter.get('/:slug', async (req, res, next) => {
         questionCount: counts[0].n,
         disclosures: disclosures(survey),
         allowsEdits: survey.allow_response_edits,
+        allowsRepeat: allowsRepeat(survey),
         accepting: isAcceptingResponses(survey),
       },
       myResponse: own
@@ -245,13 +287,18 @@ surveyRouter.get('/:slug/status', async (req, res, next) => {
 /**
  * Starts, or resumes, the caller's response.
  *
- * Re-entering a completed survey is only permitted when the survey allows
- * edits; otherwise the existing response is returned as read-only.
+ * Which of the two it is comes from `startAction`: a survey that allows edits
+ * reopens the response already given, one that allows repeats hands out a fresh
+ * one, and a survey that allows neither turns a returning respondent away.
  */
 surveyRouter.post('/:slug/start', async (req, res, next) => {
   try {
-    const result = await loadAccessibleSurvey(req.params.slug, req.user);
-    if (result.error) return res.status(result.status).json({ error: result.error, code: result.code });
+    const result = await loadAccessibleSurvey(req.params.slug, req);
+    if (result.error) {
+      return res
+        .status(result.status)
+        .json({ error: result.error, code: result.code, guild: result.guild });
+    }
 
     const { survey } = result;
     if (!isAcceptingResponses(survey)) {
@@ -261,25 +308,50 @@ surveyRouter.post('/:slug/start', async (req, res, next) => {
       });
     }
 
-    const hash = respondentHash(survey.respondent_key, req.respondentId);
-    const existing = await findOwnResponse(survey, req.respondentId);
+    // Access has already run, so a gated survey has a Discord identity behind
+    // it and an anonymous one has its cookie: there is always something to hash.
+    const identity = identityFor(survey, req);
+    const existing = await findOwnResponse(survey, identity);
 
-    if (existing?.status === 'completed' && !survey.allow_response_edits) {
+    const action = startAction(survey, existing);
+    if (action === START.REFUSE) {
       return res.status(409).json({ error: 'You have already completed this survey.' });
     }
 
-    let response = existing;
+    let response = action === START.RESUME ? existing : null;
     if (!response) {
       const country = survey.collect_location ? await countryOf(req) : null;
 
       // An account is linked only when the survey declares it and the caller
       // is actually signed in; anonymous respondents stay anonymous.
-      const { rows } = await query(
-        `INSERT INTO responses (survey_id, respondent_hash, user_id, country_code)
-         VALUES ($1, $2, $3, $4) RETURNING *`,
-        [survey.id, hash, survey.collect_identity && req.user ? req.user.id : null, country],
-      );
-      response = rows[0];
+      //
+      // `exclusive` mirrors the survey's one-per-person setting: on, and the
+      // partial unique index refuses a second row for this respondent, which is
+      // what makes two simultaneous starts safe without a lock. Off, and the
+      // row is outside the index entirely.
+      let created;
+      try {
+        const { rows } = await query(
+          `INSERT INTO responses (survey_id, respondent_hash, user_id, country_code, exclusive)
+           VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+          [
+            survey.id,
+            respondentHash(survey.respondent_key, identity),
+            survey.collect_identity && req.user ? req.user.id : null,
+            country,
+            oneResponsePerPerson(survey),
+          ],
+        );
+        created = rows[0];
+      } catch (error) {
+        // The index just adjudicated a tie: another request created this
+        // respondent's one response a moment ago. Theirs stands and this one
+        // joins it, rather than the loser of the race seeing an error.
+        if (error?.code !== '23505') throw error;
+        created = await findOwnResponse(survey, identity);
+        if (!created) throw error;
+      }
+      response = created;
     }
 
     const { rows: questions } = await query(
@@ -329,16 +401,16 @@ surveyRouter.post('/:slug/start', async (req, res, next) => {
  * Loads a response the caller owns and is still allowed to write to.
  *
  * @param {string} responseId
- * @param {string} respondentId The caller's anonymous respondent id.
+ * @param {import('express').Request} req The request, for its identities.
  * @returns {Promise<{response: object, survey: object}|{error: string, status: number}>}
  *   The response and its survey, or a refusal.
  */
-async function loadOwnWritableResponse(responseId, respondentId) {
+async function loadOwnWritableResponse(responseId, req) {
   const { rows } = await query(
     `SELECT r.id, r.survey_id, r.respondent_hash, r.status, r.started_at, r.completed_at,
             s.id AS s_id, s.slug, s.status AS s_status, s.opens_at, s.closes_at,
             s.allow_response_edits, s.collect_timing, s.collect_location, s.collect_identity,
-            s.respondent_key
+            s.require_guild, s.one_response_per_person, s.respondent_key
        FROM responses r JOIN surveys s ON s.id = r.survey_id
       WHERE r.id = $1`,
     [responseId],
@@ -353,6 +425,8 @@ async function loadOwnWritableResponse(responseId, respondentId) {
     opens_at: row.opens_at,
     closes_at: row.closes_at,
     allow_response_edits: row.allow_response_edits,
+    one_response_per_person: row.one_response_per_person,
+    require_guild: row.require_guild,
     collect_timing: row.collect_timing,
     collect_location: row.collect_location,
     collect_identity: row.collect_identity,
@@ -366,8 +440,12 @@ async function loadOwnWritableResponse(responseId, respondentId) {
 
   // A mismatched hash means the response belongs to someone else. It is
   // reported as "not found" so the route cannot be used to probe for who
-  // has responded to a survey.
-  const expected = respondentHash(row.respondent_key, respondentId);
+  // has responded to a survey. A gated survey identifies its respondents by
+  // Discord account, so losing that identity mid-survey reads the same way.
+  const identity = identityFor(survey, req);
+  if (!identity) return { error: 'Response not found.', status: 404 };
+
+  const expected = respondentHash(row.respondent_key, identity);
   if (!expected.equals(response.respondent_hash)) {
     return { error: 'Response not found.', status: 404 };
   }
@@ -391,7 +469,7 @@ async function loadOwnWritableResponse(responseId, respondentId) {
 /** Saves a single answer, so progress survives a closed tab. */
 surveyRouter.put('/responses/:id/answers/:questionId', async (req, res, next) => {
   try {
-    const loaded = await loadOwnWritableResponse(req.params.id, req.respondentId);
+    const loaded = await loadOwnWritableResponse(req.params.id, req);
     if (loaded.error) return res.status(loaded.status).json({ error: loaded.error, code: loaded.code });
 
     const { rows: questions } = await query(
@@ -435,11 +513,11 @@ surveyRouter.put('/responses/:id/answers/:questionId', async (req, res, next) =>
  *
  * @param {string} responseId
  * @param {string} questionId
- * @param {object} user Signed-in member.
+ * @param {import('express').Request} req The request, for its identities.
  * @returns {Promise<{question: object, surveyId: string}|{error: string, status: number}>}
  */
-async function loadFileQuestion(responseId, questionId, user) {
-  const loaded = await loadOwnWritableResponse(responseId, user);
+async function loadFileQuestion(responseId, questionId, req) {
+  const loaded = await loadOwnWritableResponse(responseId, req);
   if (loaded.error) return loaded;
 
   const { rows } = await query(
@@ -465,7 +543,7 @@ surveyRouter.post(
   upload.single('file'),
   async (req, res, next) => {
     try {
-      const loaded = await loadFileQuestion(req.params.id, req.params.questionId, req.respondentId);
+      const loaded = await loadFileQuestion(req.params.id, req.params.questionId, req);
       if (loaded.error) return res.status(loaded.status).json({ error: loaded.error, code: loaded.code });
       if (!req.file) return res.status(400).json({ error: 'No file was received.' });
 
@@ -528,7 +606,7 @@ surveyRouter.post(
 /** Removes a previously uploaded file. */
 surveyRouter.delete('/responses/:id/answers/:questionId/file', async (req, res, next) => {
   try {
-    const loaded = await loadFileQuestion(req.params.id, req.params.questionId, req.respondentId);
+    const loaded = await loadFileQuestion(req.params.id, req.params.questionId, req);
     if (loaded.error) return res.status(loaded.status).json({ error: loaded.error, code: loaded.code });
 
     const { rows } = await query(
@@ -556,7 +634,7 @@ surveyRouter.delete('/responses/:id/answers/:questionId/file', async (req, res, 
  */
 surveyRouter.post('/responses/:id/enter', async (req, res, next) => {
   try {
-    const loaded = await loadOwnWritableResponse(req.params.id, req.respondentId);
+    const loaded = await loadOwnWritableResponse(req.params.id, req);
     if (loaded.error) return res.status(loaded.status).json({ error: loaded.error, code: loaded.code });
     if (!loaded.survey.collect_timing) return res.json({ ok: true });
 
@@ -588,7 +666,7 @@ surveyRouter.post('/responses/:id/enter', async (req, res, next) => {
  */
 surveyRouter.post('/responses/:id/submit', async (req, res, next) => {
   try {
-    const loaded = await loadOwnWritableResponse(req.params.id, req.respondentId);
+    const loaded = await loadOwnWritableResponse(req.params.id, req);
     if (loaded.error) return res.status(loaded.status).json({ error: loaded.error, code: loaded.code });
 
     const { response, survey } = loaded;

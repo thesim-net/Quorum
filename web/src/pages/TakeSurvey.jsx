@@ -1,7 +1,77 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { api } from '../api.js';
 import { QuestionInput } from '../components/QuestionInput.jsx';
+
+// Refusals from a survey gated on a Discord server. Anything else is an
+// ordinary error and shown as one.
+const GATE_CODES = new Set([
+  'discord_login_required',
+  'not_in_guild',
+  'not_eligible',
+  'discord_unavailable',
+]);
+
+// A respondent sign-in that did not complete comes back on the query string,
+// and knows more about why than the survey's own refusal can. `invalid_state`
+// means the round trip was interrupted, so the answer is to start it again.
+const SIGN_IN_ERRORS = {
+  not_in_guild: 'not_in_guild',
+  discord_unavailable: 'discord_unavailable',
+  invalid_state: 'discord_login_required',
+};
+
+/**
+ * What a survey tied to a Discord server tells someone it cannot let in.
+ *
+ * Each state says what it can act on and nothing more: which server to join,
+ * that the account does not qualify - never which role or channel would have
+ * made it qualify - or simply to come back shortly.
+ *
+ * @param {{code: string, guild: string|null, slug: string}} props
+ * @returns {JSX.Element} The page.
+ */
+function GateNotice({ code, guild, slug }) {
+  const server = guild || 'the Discord server this survey was made for';
+
+  const notices = {
+    discord_login_required: {
+      title: 'Members only',
+      body: `This survey is for members of ${server}. Sign in with Discord and it will open if you are one.`,
+    },
+    not_in_guild: {
+      title: 'Members only',
+      body: `This survey is only open to members of ${server}.`,
+    },
+    not_eligible: {
+      title: 'Not available to you',
+      body: 'Your Discord account does not have access to this survey. If you think that is wrong, ask whoever set it up.',
+    },
+    discord_unavailable: {
+      title: 'Not available right now',
+      body: 'This survey cannot be opened at the moment. Try again shortly.',
+    },
+  };
+
+  const notice = notices[code] ?? notices.discord_unavailable;
+
+  return (
+    <div className="shell">
+      <div className="card">
+        <h1>{notice.title}</h1>
+        <p className="muted">{notice.body}</p>
+        {code === 'discord_login_required' ? (
+          <a className="button primary" href={`/api/auth/discord/respond?slug=${slug}`}>
+            Continue with Discord
+          </a>
+        ) : null}
+        <p style={{ marginTop: '1rem', marginBottom: 0 }}>
+          <Link to="/">Back to surveys</Link>
+        </p>
+      </div>
+    </div>
+  );
+}
 
 /**
  * Whether an answer to a controlling question satisfies a condition.
@@ -87,6 +157,7 @@ function Disclosure({ disclosures }) {
  */
 export function TakeSurvey() {
   const { slug } = useParams();
+  const [params] = useSearchParams();
   const [intro, setIntro] = useState(null);
   const [session, setSession] = useState(null);
   const [index, setIndex] = useState(0);
@@ -100,6 +171,7 @@ export function TakeSurvey() {
   const answersRef = useRef(answers);
   answersRef.current = answers;
   const [errorCode, setErrorCode] = useState(null);
+  const [guild, setGuild] = useState(null);
 
   useEffect(() => {
     api(`/surveys/${slug}`)
@@ -107,6 +179,7 @@ export function TakeSurvey() {
       .catch((e) => {
         setError(e.message);
         setErrorCode(e.payload?.code ?? null);
+        setGuild(e.payload?.guild ?? null);
       });
   }, [slug]);
 
@@ -269,25 +342,11 @@ export function TakeSurvey() {
     }
   };
 
-  // A Discord-gated survey asks for the sign-in it needs rather than dead-ending.
-  if (error && !intro && errorCode === 'discord_login_required') {
-    return (
-      <div className="shell">
-        <div className="card">
-          <h1>Discord members only</h1>
-          <p className="muted">
-            This survey is restricted to certain members of our Discord server, so it needs you to
-            sign in with Discord first.
-          </p>
-          <a className="button primary" href="/api/auth/discord/login">
-            Sign in with Discord
-          </a>
-          <p style={{ marginTop: '1rem', marginBottom: 0 }}>
-            <Link to="/">Back to surveys</Link>
-          </p>
-        </div>
-      </div>
-    );
+  // A survey tied to a Discord server asks for what it needs, or says plainly
+  // that it cannot open, rather than dead-ending on a bare error.
+  const gateCode = SIGN_IN_ERRORS[params.get('error')] ?? errorCode;
+  if (error && !intro && GATE_CODES.has(gateCode)) {
+    return <GateNotice code={gateCode} guild={guild} slug={slug} />;
   }
 
   if (error && !intro) return <div className="shell"><div className="error">{error}</div></div>;
@@ -322,7 +381,11 @@ export function TakeSurvey() {
           <h1>Thanks</h1>
           <p className="muted">
             Your response has been recorded.
-            {intro.survey.allowsEdits ? ' You can come back and change your answers any time while this survey is open.' : ''}
+            {intro.survey.allowsEdits
+              ? ' You can come back and change your answers any time while this survey is open.'
+              : intro.survey.allowsRepeat
+                ? ' You can answer again any time while this survey is open.'
+                : ''}
           </p>
           <Link to="/">Back to surveys</Link>
         </div>
@@ -333,6 +396,18 @@ export function TakeSurvey() {
   // Intro screen: disclosures are shown here, before any question is visible.
   if (!session) {
     const alreadyDone = intro.myResponse?.status === 'completed';
+    // Editing wins over answering again, so someone returning to a survey that
+    // allows both picks up the response they already gave.
+    const done = alreadyDone && !intro.survey.allowsEdits && !intro.survey.allowsRepeat;
+
+    /** What pressing the button will actually do. */
+    const label = !alreadyDone
+      ? intro.myResponse
+        ? 'Resume'
+        : 'Start survey'
+      : intro.survey.allowsEdits
+        ? 'Change my answers'
+        : 'Answer again';
 
     return (
       <div className="shell">
@@ -341,18 +416,22 @@ export function TakeSurvey() {
           {intro.survey.description ? <p>{intro.survey.description}</p> : null}
           <p className="muted">
             {intro.survey.questionCount} question{intro.survey.questionCount === 1 ? '' : 's'}
-            {intro.survey.allowsEdits ? ' · you can change your answers later' : ''}
+            {intro.survey.allowsEdits
+              ? ' · you can change your answers later'
+              : intro.survey.allowsRepeat
+                ? ' · you can answer more than once'
+                : ''}
           </p>
 
           <Disclosure disclosures={intro.survey.disclosures} />
 
           {error ? <div className="error">{error}</div> : null}
 
-          {alreadyDone && !intro.survey.allowsEdits ? (
+          {done ? (
             <p className="muted">You have already completed this survey.</p>
           ) : (
             <button type="button" className="primary" onClick={begin} disabled={busy}>
-              {alreadyDone ? 'Change my answers' : intro.myResponse ? 'Resume' : 'Start survey'}
+              {label}
             </button>
           )}
         </div>

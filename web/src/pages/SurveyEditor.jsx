@@ -452,7 +452,11 @@ export function SurveyEditor() {
   const { id } = useParams();
   const [survey, setSurvey] = useState(null);
   const [questions, setQuestions] = useState([]);
-  const [discord, setDiscord] = useState({ roles: [], channels: [] });
+  const [discord, setDiscord] = useState({ guild: null, roles: [], channels: [] });
+  // Whether a Discord server is connected at all, and what it is called. Comes
+  // with the survey so the gate section can render before - or without - the
+  // roles and channels arriving.
+  const [server, setServer] = useState({ ready: false, guildName: null });
   const [plugins, setPlugins] = useState({});
   const [responses, setResponses] = useState(null);
   const [pendingLoss, setPendingLoss] = useState(null);
@@ -500,13 +504,15 @@ export function SurveyEditor() {
         setQuestions(data.questions);
         setResponses(data.responses);
         setPlugins(data.plugins ?? {});
+        setServer(data.discord ?? { ready: false, guildName: null });
 
         // Roles and channels come from the discord plugin, so they are only
-        // asked for when it is enabled; the gate card explains itself otherwise.
-        if (data.plugins?.discord) {
+        // asked for when a server is connected; the gate card explains itself
+        // otherwise, and never waits on this to render.
+        if (data.discord?.ready) {
           api('/plugin/discord/guild')
             .then(setDiscord)
-            .catch(() => setDiscord({ roles: [], channels: [] }));
+            .catch(() => setDiscord({ guild: null, roles: [], channels: [] }));
         }
       })
       .catch((e) => setError(e.message));
@@ -627,6 +633,10 @@ export function SurveyEditor() {
   if (error && !survey) return <div className="shell"><div className="error">{error}</div></div>;
   if (!survey) return <div className="shell muted">Loading...</div>;
 
+  // The real server name wherever it is known, and generic wording when it is
+  // not: naming it is worth having, but never worth blocking the editor for.
+  const serverName = discord.guild?.name || server.guildName || 'the connected Discord server';
+
   return (
     <div className="shell">
       <p>
@@ -660,9 +670,24 @@ export function SurveyEditor() {
       <div className="card">
         <h2>Participation</h2>
         <Toggle
+          checked={survey.oneResponsePerPerson !== false}
+          onChange={(oneResponsePerPerson) => patch({ oneResponsePerPerson })}
+          label="Allow one response per person"
+          hint={
+            survey.requireGuild
+              ? 'Counted per Discord account, since this survey knows who is answering.'
+              : 'Counted per browser, which is all an anonymous survey can know. Switch it off to let the same person answer as often as they like.'
+          }
+        />
+        <Toggle
           checked={!!survey.allowResponseEdits}
           onChange={(allowResponseEdits) => patch({ allowResponseEdits })}
           label="Let people change their answers after submitting"
+          hint={
+            survey.oneResponsePerPerson === false
+              ? 'Coming back reopens their most recent response rather than starting another one.'
+              : 'They can reopen their response at any time while the survey is open.'
+          }
         />
       </div>
 
@@ -804,72 +829,103 @@ export function SurveyEditor() {
         </div>
       ) : null}
 
-      {plugins.discord ? (
+      {server.ready ? (
       <div className="card">
         <h2>Who can take it</h2>
-        <p className="muted" style={{ fontSize: '0.85rem' }}>
-          Leave both lists empty and anyone with the link can take the survey. Restricting by role
-          or channel means participants must sign in with Discord.
-        </p>
 
-        <label>
-          <span className="field-label">Roles (any one of these)</span>
-          <select
-            multiple
-            size={Math.min(8, Math.max(3, discord.roles.length))}
-            value={survey.gateRoleIds ?? []}
-            onChange={(e) =>
-              patch({ gateRoleIds: [...e.target.selectedOptions].map((o) => o.value) })
-            }
-          >
-            {discord.roles.map((role) => (
-              <option key={role.id} value={role.id}>
-                {role.name}
-              </option>
-            ))}
-          </select>
-        </label>
+        {/* One decision first - is this survey for the server or for anyone -
+            and only then the narrowing, so the two are never mistaken for
+            unrelated settings. */}
+        <Toggle
+          checked={!!survey.requireGuild}
+          onChange={(requireGuild) => patch({ requireGuild })}
+          label={`Only members of ${serverName} can take this survey`}
+          hint="Participants sign in with Discord and their membership is checked before the survey opens. Left off, the survey is truly anonymous: no sign-in, and Discord is never contacted."
+        />
 
-        <label>
-          <span className="field-label">Channels (can see any one of these)</span>
-          <select
-            multiple
-            size={Math.min(8, Math.max(3, discord.channels.length))}
-            value={survey.gateChannelIds ?? []}
-            onChange={(e) =>
-              patch({ gateChannelIds: [...e.target.selectedOptions].map((o) => o.value) })
-            }
-          >
-            {discord.channels.map((channel) => (
-              <option key={channel.id} value={channel.id}>
-                #{channel.name}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        {/* Both lists populated is an AND, which is narrower than it looks and
-            the easiest way to lock everyone out. Say so plainly. */}
-        {(survey.gateRoleIds?.length ?? 0) > 0 &&
-        (survey.gateChannelIds?.length ?? 0) > 0 ? (
-          <div className="confirm">
-            <h3>Both requirements must be met</h3>
-            <p style={{ marginBottom: 0 }}>
-              A member needs one of the {survey.gateRoleIds.length} selected role
-              {survey.gateRoleIds.length === 1 ? '' : 's'} <strong>and</strong> must be able to see
-              one of the {survey.gateChannelIds.length} selected channel
-              {survey.gateChannelIds.length === 1 ? '' : 's'}. Anyone missing either is refused.
+        {survey.requireGuild ? (
+          <>
+            <p className="muted" style={{ fontSize: '0.85rem', marginTop: '1rem' }}>
+              Optionally narrow it further to who <strong>from {serverName}</strong> may take it.
+              Leave both lists empty and every member can.
             </p>
-          </div>
+
+            <label>
+              <span className="field-label">Roles (any one of these)</span>
+              <select
+                multiple
+                size={Math.min(8, Math.max(3, discord.roles.length))}
+                value={survey.gateRoleIds ?? []}
+                onChange={(e) =>
+                  patch({ gateRoleIds: [...e.target.selectedOptions].map((o) => o.value) })
+                }
+              >
+                {discord.roles.map((role) => (
+                  <option key={role.id} value={role.id}>
+                    {role.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              <span className="field-label">Channels (can see any one of these)</span>
+              <select
+                multiple
+                size={Math.min(8, Math.max(3, discord.channels.length))}
+                value={survey.gateChannelIds ?? []}
+                onChange={(e) =>
+                  patch({ gateChannelIds: [...e.target.selectedOptions].map((o) => o.value) })
+                }
+              >
+                {discord.channels.map((channel) => (
+                  <option key={channel.id} value={channel.id}>
+                    #{channel.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            {/* Both lists populated is an AND, which is narrower than it looks
+                and the easiest way to lock everyone out. Say so plainly. */}
+            {(survey.gateRoleIds?.length ?? 0) > 0 &&
+            (survey.gateChannelIds?.length ?? 0) > 0 ? (
+              <div className="confirm">
+                <h3>Both requirements must be met</h3>
+                <p style={{ marginBottom: 0 }}>
+                  A member needs one of the {survey.gateRoleIds.length} selected role
+                  {survey.gateRoleIds.length === 1 ? '' : 's'} <strong>and</strong> must be able to
+                  see one of the {survey.gateChannelIds.length} selected channel
+                  {survey.gateChannelIds.length === 1 ? '' : 's'}. Anyone missing either is refused.
+                </p>
+              </div>
+            ) : null}
+          </>
         ) : null}
       </div>
       ) : (
       <div className="card">
         <h2>Who can take it</h2>
-        <p className="muted" style={{ marginBottom: 0 }}>
-          Anyone with the link. Restricting a survey to Discord roles or channels needs the
-          Discord Integration plugin.
-        </p>
+        {survey.requireGuild ? (
+          // Gated, with nothing left to check it against. The toggle stays so
+          // this is a decision the admin can still reverse from here.
+          <>
+            <div className="error">
+              This survey is limited to the members of a Discord server, and no server is connected,
+              so nobody can take it. Connect one under Admin, Plugins, or turn the limit off here.
+            </div>
+            <Toggle
+              checked
+              onChange={(requireGuild) => patch({ requireGuild })}
+              label="Only members of a Discord server can take this survey"
+            />
+          </>
+        ) : (
+          <p className="muted" style={{ marginBottom: 0 }}>
+            Anyone with the link, anonymously. Limiting a survey to the members of a Discord server
+            needs the Discord Integration plugin enabled with a server connected.
+          </p>
+        )}
       </div>
       )}
 
