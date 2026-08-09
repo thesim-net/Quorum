@@ -42,8 +42,8 @@ Every page has a footer badge linking to a **`/verify`** page. The running serve
 The verifiable proof is on the published image. Each release carries a [Sigstore build-provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds) binding the image digest to this repo, this commit, and the workflow that built it. Anyone can check it, no GitHub account needed:
 
 ```
-gh attestation verify oci://ghcr.io/thomasloupe/quorum-api:1.1.0 --repo thomasloupe/Quorum
-gh attestation verify oci://ghcr.io/thomasloupe/quorum-web:1.1.0 --repo thomasloupe/Quorum
+gh attestation verify oci://ghcr.io/thomasloupe/quorum-api:1.2.0 --repo thomasloupe/Quorum
+gh attestation verify oci://ghcr.io/thomasloupe/quorum-web:1.2.0 --repo thomasloupe/Quorum
 ```
 
 A pass proves the image was built by this repo's release workflow from that commit, not hand-built or swapped. It attests the published artifact, not any one operator's live container: an operator controls their own server, so no rendered badge can prove a running site is untampered. The guarantee lives on the image you pull, before it ever runs.
@@ -65,6 +65,8 @@ Two tiers:
 - **Administrator:** only the permissions granted: create/edit surveys, open/close surveys, delete surveys, and view results/export.
 
 Admins are local accounts (created with a one-time password shown once), or Discord members granted by user id when that plugin is connected. A plain administrator never sees that super administrators exist. Admins can also be granted by a Discord role or channel chosen in the Discord plugin settings; those grant the administrator tier, never super administrator. You cannot remove your own access, and the last super administrator cannot be removed.
+
+**One person is one account.** Where the Discord plugin is connected, an admin holds both identities: a local username and password, and a linked Discord id. Both are asked for once, as a single "finish setting up your account" flow with a fixed order, and a step already satisfied is skipped. Signing in with a Discord account nobody has linked creates nothing; it says so and points at the sign-in form, because accounts exist for administrators and respondents need none. Linking runs over the same OAuth redirect URL as signing in, and a Discord id already held by another account is refused rather than moved. Anyone can unlink their own Discord from Settings, and a super admin can unlink somebody else's from the Users tab, except where that would leave an account with no way to sign in at all.
 
 ## Plugins
 
@@ -99,7 +101,7 @@ web/            React SPA
 cd api && npm test
 ```
 
-Covers Discord permission resolution, answer validation, response timing, result aggregation, file-upload validation, password hashing, and TOTP (against the RFC 4226/6238 vectors).
+Covers Discord permission resolution, Discord account linking and the OAuth intent it is carried by, the forced-onboarding order, answer validation, response timing, result aggregation, file-upload validation, password hashing, and TOTP (against the RFC 4226/6238 vectors).
 
 ## Notes
 

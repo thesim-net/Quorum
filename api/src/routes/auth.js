@@ -3,6 +3,7 @@ import rateLimit from 'express-rate-limit';
 import { config } from '../config.js';
 import { query } from '../db/pool.js';
 import { hashPassword, verifyPassword } from '../lib/passwords.js';
+import { onboardingState } from '../lib/onboarding.js';
 import { current, effectiveAuthMethods } from '../lib/settings.js';
 import { PLUGINS, isPluginEnabled } from '../lib/plugins.js';
 import { TIERS, sanitisePermissions } from '../lib/permissionSet.js';
@@ -260,18 +261,35 @@ authRouter.post('/logout', async (req, res, next) => {
  * server-side and surfaced as a boolean per survey.
  */
 authRouter.get('/me', (req, res) => {
+  const settings = current();
   const plugins = {
-    discord: isPluginEnabled(current().plugins, PLUGINS.DISCORD),
-    twofactor: isPluginEnabled(current().plugins, PLUGINS.TWOFACTOR),
+    discord: isPluginEnabled(settings.plugins, PLUGINS.DISCORD),
+    twofactor: isPluginEnabled(settings.plugins, PLUGINS.TWOFACTOR),
   };
 
   // The wordmark animation default is public so a signed-out visitor can
   // resolve it before any account is loaded.
-  const asciiAnimationDefault = current().asciiAnimationDefault;
+  const asciiAnimationDefault = settings.asciiAnimationDefault;
 
   if (!req.user) {
     return res.json({ user: null, plugins, devAuthBypass: config.devAuthBypass, asciiAnimationDefault });
   }
+
+  // Every admin ends up holding both identities: a local username and password,
+  // and a linked Discord account. The two forced steps are resolved into one
+  // ordered flow here, so the panel is never asked to render both at once and
+  // satisfying one can never re-trigger the other.
+  const onboarding = onboardingState({
+    isAdmin: req.user.isAdmin,
+    hasPassword: req.user.hasPassword,
+    hasDiscordId: Boolean(req.user.discordId),
+    // Linking is only asked for where it can actually be done, so a deployment
+    // without the plugin connected is unaffected.
+    discordReady: plugins.discord && settings.discord.configured,
+    // The dev bypass has neither real credentials nor a Discord application
+    // behind it, so it is exempt from both steps.
+    exempt: config.devAuthBypass,
+  });
 
   return res.json({
     plugins,
@@ -287,9 +305,15 @@ authRouter.get('/me', (req, res) => {
       hasUsername: Boolean(req.user.username),
       // An admin without a local password must set one before using the panel,
       // so flipping to local-only sign-in can never lock a Discord admin out.
-      // The dev bypass has no real credentials, so it is exempt.
-      mustSetCredentials:
-        req.user.isAdmin && !req.user.hasPassword && !config.devAuthBypass,
+      mustSetCredentials: onboarding.mustSetCredentials,
+      // An admin with no Discord id must link one, so one person is one
+      // account rather than a local account and a Discord account that never
+      // meet.
+      mustLinkDiscord: onboarding.mustLinkDiscord,
+      // The outstanding step, and every step this account is asked for, so the
+      // panel can render one flow with honest progress.
+      onboardingStep: onboarding.step,
+      onboardingSteps: onboarding.steps,
       isAdmin: req.user.isAdmin,
       isSuperAdmin: req.user.isSuperAdmin,
       tier: req.user.tier,

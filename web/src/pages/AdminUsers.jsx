@@ -138,6 +138,28 @@ export function AdminUsers() {
   };
 
   /**
+   * Unlinks an admin's Discord identity.
+   *
+   * The server refuses when the account has no password, since that would
+   * leave it with no way to sign in at all.
+   *
+   * @param {object} admin The admin being unlinked.
+   */
+  const unlinkDiscord = async (admin) => {
+    setError(null);
+    setStatus(null);
+    try {
+      await api(`/plugin/discord/link/${admin.id}`, { method: 'DELETE' });
+      setStatus(
+        `Discord unlinked from ${admin.username}. They are asked to link again on their next request.`,
+      );
+      await load();
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
+  /**
    * Toggles whether an admin must use two-factor authentication.
    *
    * @param {object} admin The admin being changed.
@@ -306,8 +328,17 @@ export function AdminUsers() {
                   <span className="badge" style={{ marginLeft: '0.5rem' }}>You</span>
                 ) : null}
                 <br />
+                {/* Both identities are shown separately: an account is meant to
+                    hold each of them, so "which one is missing" is the useful
+                    fact rather than "which kind of account is this". */}
                 <span className="muted" style={{ fontSize: '0.8rem' }}>
-                  {admin.discordId ?? 'Local account'}
+                  Password: {admin.local ? 'set' : 'not set'}
+                  {discordOn ? (
+                    <>
+                      <br />
+                      Discord: {admin.discordId ?? 'not linked'}
+                    </>
+                  ) : null}
                 </span>
               </th>
               <td>
@@ -356,6 +387,13 @@ export function AdminUsers() {
                         <>
                           <button type="button" onClick={() => resetPassword(admin)}>
                             Reset password
+                          </button>{' '}
+                        </>
+                      ) : null}
+                      {discordOn && admin.discordId ? (
+                        <>
+                          <button type="button" onClick={() => unlinkDiscord(admin)}>
+                            Unlink Discord
                           </button>{' '}
                         </>
                       ) : null}

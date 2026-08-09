@@ -138,6 +138,70 @@ function SetUsername({ current, onChange }) {
 }
 
 /**
+ * The signed-in admin's own Discord identity.
+ *
+ * Every admin is expected to hold both identities, so an unlinked account gets
+ * the link button here as well as in the forced step. Unlinking is allowed, and
+ * the step simply applies again afterwards; the server refuses it outright when
+ * it would leave the account with no way to sign in.
+ *
+ * @param {{discordId: string|null}} props
+ * @returns {JSX.Element} The section.
+ */
+function DiscordIdentity({ discordId }) {
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  /** Drops the linked Discord identity. */
+  const unlink = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api('/auth/discord/unlink', { method: 'POST' });
+      // A full reload, so the panel is never left running behind a step the
+      // unlink has just brought back.
+      window.location.href = '/admin/settings';
+    } catch (e) {
+      setError(e.message);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: '1.25rem' }}>
+      <h3>Discord account</h3>
+      {error ? <div className="error">{error}</div> : null}
+
+      {discordId ? (
+        <>
+          <p className="muted">
+            Linked to Discord id <strong>{discordId}</strong>. Signing in either way reaches this
+            same account.
+          </p>
+          <p className="muted" style={{ fontSize: '0.82rem' }}>
+            Unlinking asks you to link again on your next request, and any access granted by a
+            Discord role or channel ends with the link.
+          </p>
+          <button type="button" className="danger" disabled={busy} onClick={unlink}>
+            {busy ? 'Unlinking...' : 'Unlink Discord'}
+          </button>
+        </>
+      ) : (
+        <>
+          <p className="muted">
+            Not linked yet. Linking puts your Discord identity on this account, so signing in with
+            Discord reaches it instead of creating a second one.
+          </p>
+          <a className="button" href="/api/auth/discord/link">
+            Link Discord
+          </a>
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
  * The signed-in admin's own two-factor enrolment.
  *
  * Shows a QR code and the plain secret; a first valid code confirms. Removal
@@ -530,6 +594,7 @@ export function AdminSettings() {
         <h2>Your account</h2>
         <ChangePassword />
         <SetUsername current={account?.username ?? null} onChange={loadAccount} />
+        {plugins.discord ? <DiscordIdentity discordId={account?.discordId ?? null} /> : null}
         {plugins.twofactor ? <TwoFactorAccount /> : null}
       </div>
 

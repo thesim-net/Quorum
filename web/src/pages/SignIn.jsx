@@ -7,6 +7,13 @@ const OAUTH_ERRORS = {
   not_in_guild: 'That Discord account is not a member of our server.',
   invalid_state: 'Sign-in expired. Please try again.',
   discord_unavailable: 'Discord sign-in is not available right now.',
+  // A Discord account nobody has claimed signs in as nobody. It is never turned
+  // into a new, empty account, so the way forward is to sign in to the real one
+  // and attach Discord to it.
+  discord_unlinked:
+    'This Discord account is not linked to a Quorum account. Sign in with your username and ' +
+    'password, then link Discord from Settings.',
+  link_signed_out: 'Your session ended before linking finished. Sign in, then link from Settings.',
 };
 
 /**

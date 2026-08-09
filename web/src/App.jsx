@@ -39,8 +39,11 @@ const AdminGroups = lazy(() =>
 const AdminAbout = lazy(() =>
   import('./pages/AdminAbout.jsx').then((m) => ({ default: m.AdminAbout })),
 );
-const SetCredentials = lazy(() =>
-  import('./pages/SetCredentials.jsx').then((m) => ({ default: m.SetCredentials })),
+const FinishSetup = lazy(() =>
+  import('./pages/FinishSetup.jsx').then((m) => ({ default: m.FinishSetup })),
+);
+const LinkDiscordPage = lazy(() =>
+  import('./pages/LinkDiscord.jsx').then((m) => ({ default: m.LinkDiscordPage })),
 );
 
 /**
@@ -415,12 +418,14 @@ export function App() {
             path="/login"
             element={user ? <Navigate to="/" replace /> : <SignIn devAuthBypass={devAuthBypass} />}
           />
-          {user?.isAdmin && user.mustSetCredentials ? (
+          {user?.isAdmin && user.onboardingStep ? (
             <>
-              {/* An admin without a local password must set one before any admin
-                  page renders, so switching to local-only sign-in cannot lock
-                  them out. */}
-              <Route path="/admin/*" element={<SetCredentials user={user} />} />
+              {/* Setting credentials and linking Discord are one flow with a
+                  fixed order, decided server-side, so the whole admin area
+                  resolves to whichever single step is outstanding. Nothing here
+                  chooses between them, which is what stops the two forced steps
+                  from bouncing an admin back and forth. */}
+              <Route path="/admin/*" element={<FinishSetup user={user} onSignOut={logout} />} />
               <Route path="/surveys" element={<Navigate to="/admin" replace />} />
               <Route path="/plugins" element={<Navigate to="/admin" replace />} />
             </>
@@ -440,6 +445,9 @@ export function App() {
                   layout rather than under it. */}
               <Route path="/admin/surveys/:id" element={<SurveyEditor />} />
               <Route path="/admin/surveys/:id/results" element={<SurveyResults />} />
+              {/* Linking Discord from Settings lands back here, the same page
+                  the forced step uses, so both routes finish the same way. */}
+              <Route path="/admin/link-discord" element={<LinkDiscordPage />} />
               {/* The Discord wizard is super admins only, enforced server-side
                   too. Reachable while the plugin is off, so a server can be
                   connected before switching it on. */}
