@@ -42,8 +42,8 @@ Every page has a footer badge linking to a **`/verify`** page. The running serve
 The verifiable proof is on the published image. Each release carries a [Sigstore build-provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds) binding the image digest to this repo, this commit, and the workflow that built it. Anyone can check it, no GitHub account needed:
 
 ```
-gh attestation verify oci://ghcr.io/thomasloupe/quorum-api:1.0.3 --repo thomasloupe/Quorum
-gh attestation verify oci://ghcr.io/thomasloupe/quorum-web:1.0.3 --repo thomasloupe/Quorum
+gh attestation verify oci://ghcr.io/thomasloupe/quorum-api:1.1.0 --repo thomasloupe/Quorum
+gh attestation verify oci://ghcr.io/thomasloupe/quorum-web:1.1.0 --repo thomasloupe/Quorum
 ```
 
 A pass proves the image was built by this repo's release workflow from that commit, not hand-built or swapped. It attests the published artifact, not any one operator's live container: an operator controls their own server, so no rendered badge can prove a running site is untampered. The guarantee lives on the image you pull, before it ever runs.

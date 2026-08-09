@@ -25,6 +25,27 @@ const loginLimiter = rateLimit({
 const DUMMY_HASH =
   'scrypt$16384$8$1$xtPm/4XR722L/e9XE9xkACL7Q9vhz+e7X8tjFjRSlu4=$Boco63O+i+ndm9g/XDNB5VCgSzgW+VTxdt46GArnYKBcX9zP7FIdaSd2Zuqy/+ZSeqEwh+PiEdHII39fTE4Sgw==';
 
+// Local sign-in names: the same shape the admin panel enforces on creation.
+const USERNAME_PATTERN = /^[a-zA-Z0-9._-]{3,32}$/;
+
+/**
+ * Whether a username is free among accounts that hold a local password.
+ *
+ * The local-username uniqueness index only covers password holders, so a name
+ * mirrored from Discord on a passwordless account never blocks a local one.
+ *
+ * @param {string} username Candidate username.
+ * @param {string} selfId The caller's user id, excluded from the check.
+ * @returns {Promise<boolean>} True when the name is available.
+ */
+async function usernameAvailable(username, selfId) {
+  const { rows } = await query(
+    'SELECT 1 FROM users WHERE lower(username) = lower($1) AND password_hash IS NOT NULL AND id <> $2',
+    [username, selfId],
+  );
+  return rows.length === 0;
+}
+
 /**
  * Reports which sign-in methods are available, for the sign-in page.
  *
@@ -86,36 +107,99 @@ authRouter.post('/login', loginLimiter, async (req, res, next) => {
 });
 
 /**
- * Changes the caller's own password.
+ * Sets or changes the caller's own password.
  *
- * Takes the current password, so a walked-away-from session is not enough to
- * take the account over.
+ * Changing an existing password takes the current one, so a walked-away-from
+ * session is not enough to take the account over. Setting an INITIAL password
+ * (an account that has none, e.g. a Discord admin) needs no current password;
+ * it may set a username in the same step, and requires one when the account has
+ * none, since local sign-in needs a unique name.
  */
 authRouter.post('/password', requireMember, async (req, res, next) => {
   try {
     const currentPassword = String(req.body?.currentPassword ?? '');
     const newPassword = String(req.body?.newPassword ?? '');
+    const requestedUsername =
+      req.body?.username != null ? String(req.body.username).trim() : null;
 
-    const { rows } = await query('SELECT password_hash FROM users WHERE id = $1', [req.user.id]);
-    if (!rows[0]?.password_hash) {
-      return res.status(400).json({ error: 'This account has no password to change.' });
-    }
+    const { rows } = await query('SELECT password_hash, username FROM users WHERE id = $1', [
+      req.user.id,
+    ]);
+    const row = rows[0] ?? {};
+    const hasPassword = Boolean(row.password_hash);
 
-    if (!(await verifyPassword(currentPassword, rows[0].password_hash))) {
-      return res.status(403).json({ error: 'The current password is wrong.' });
-    }
     if (newPassword.length < 8 || newPassword.length > 200) {
       return res.status(400).json({ error: 'Passwords need at least 8 characters.' });
     }
 
-    await query('UPDATE users SET password_hash = $2 WHERE id = $1', [
+    // Changing an existing password proves the old one; the initial set does not.
+    if (hasPassword && !(await verifyPassword(currentPassword, row.password_hash))) {
+      return res.status(403).json({ error: 'The current password is wrong.' });
+    }
+
+    // Decide the username the password will sign in with.
+    let username = row.username;
+    if (requestedUsername !== null) {
+      if (!USERNAME_PATTERN.test(requestedUsername)) {
+        return res.status(400).json({
+          error: 'Usernames are 3-32 characters: letters, numbers, dots, dashes, underscores.',
+        });
+      }
+      username = requestedUsername;
+    }
+
+    // Setting an initial password puts the row into the local-username index, so
+    // a username is needed and must be free among password holders.
+    if (!hasPassword) {
+      if (!username) {
+        return res.status(400).json({ error: 'Choose a username to sign in with.' });
+      }
+      if (!(await usernameAvailable(username, req.user.id))) {
+        return res.status(409).json({ error: 'That username is already taken.' });
+      }
+    } else if (requestedUsername !== null && !(await usernameAvailable(username, req.user.id))) {
+      return res.status(409).json({ error: 'That username is already taken.' });
+    }
+
+    await query('UPDATE users SET password_hash = $2, username = COALESCE($3, username) WHERE id = $1', [
       req.user.id,
       await hashPassword(newPassword),
+      username,
     ]);
 
     await query(
+      `INSERT INTO audit_log (actor_id, action, target_type, target_id, meta)
+       VALUES ($1, $2, 'user', $3, $4)`,
+      [req.user.id, hasPassword ? 'auth.password_change' : 'auth.password_set', req.user.id, {}],
+    );
+    return res.json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * Sets or changes the caller's own local username.
+ *
+ * Available to everyone, including Discord-authenticated admins, so a local
+ * username can be chosen independently of the password step.
+ */
+authRouter.post('/username', requireMember, async (req, res, next) => {
+  try {
+    const username = String(req.body?.username ?? '').trim();
+    if (!USERNAME_PATTERN.test(username)) {
+      return res.status(400).json({
+        error: 'Usernames are 3-32 characters: letters, numbers, dots, dashes, underscores.',
+      });
+    }
+    if (!(await usernameAvailable(username, req.user.id))) {
+      return res.status(409).json({ error: 'That username is already taken.' });
+    }
+
+    await query('UPDATE users SET username = $2 WHERE id = $1', [req.user.id, username]);
+    await query(
       `INSERT INTO audit_log (actor_id, action, target_type, target_id)
-       VALUES ($1, 'auth.password_change', 'user', $2)`,
+       VALUES ($1, 'auth.username_change', 'user', $2)`,
       [req.user.id, req.user.id],
     );
     return res.json({ ok: true });
@@ -181,11 +265,18 @@ authRouter.get('/me', (req, res) => {
     twofactor: isPluginEnabled(current().plugins, PLUGINS.TWOFACTOR),
   };
 
-  if (!req.user) return res.json({ user: null, plugins, devAuthBypass: config.devAuthBypass });
+  // The wordmark animation default is public so a signed-out visitor can
+  // resolve it before any account is loaded.
+  const asciiAnimationDefault = current().asciiAnimationDefault;
+
+  if (!req.user) {
+    return res.json({ user: null, plugins, devAuthBypass: config.devAuthBypass, asciiAnimationDefault });
+  }
 
   return res.json({
     plugins,
     devAuthBypass: config.devAuthBypass,
+    asciiAnimationDefault,
     user: {
       id: req.user.id,
       username: req.user.username,
@@ -193,13 +284,44 @@ authRouter.get('/me', (req, res) => {
       avatar: req.user.avatar,
       discordId: req.user.discordId,
       hasPassword: req.user.hasPassword,
+      hasUsername: Boolean(req.user.username),
+      // An admin without a local password must set one before using the panel,
+      // so flipping to local-only sign-in can never lock a Discord admin out.
+      // The dev bypass has no real credentials, so it is exempt.
+      mustSetCredentials:
+        req.user.isAdmin && !req.user.hasPassword && !config.devAuthBypass,
       isAdmin: req.user.isAdmin,
       isSuperAdmin: req.user.isSuperAdmin,
       tier: req.user.tier,
       // The saved skin/mode, so it is applied on sign-in from any device.
       theme: req.user.prefs?.theme ?? null,
+      // The saved wordmark-animation preference, or null when unset.
+      asciiAnimation:
+        typeof req.user.prefs?.asciiAnimation === 'boolean' ? req.user.prefs.asciiAnimation : null,
     },
   });
+});
+
+/**
+ * Saves a per-user interface preference.
+ *
+ * Currently just the wordmark animation toggle; validated to a boolean and
+ * written into users.prefs so it follows the account across devices.
+ */
+authRouter.put('/prefs', requireMember, async (req, res, next) => {
+  try {
+    if (typeof req.body?.asciiAnimation !== 'boolean') {
+      return res.status(400).json({ error: 'Unknown preference.' });
+    }
+
+    await query(
+      `UPDATE users SET prefs = jsonb_set(prefs, '{asciiAnimation}', $2::jsonb) WHERE id = $1`,
+      [req.user.id, JSON.stringify(req.body.asciiAnimation)],
+    );
+    return res.json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
 });
 
 /** Known skins and modes, so an arbitrary value cannot be stored. */

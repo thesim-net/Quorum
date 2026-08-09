@@ -27,6 +27,21 @@ const Plugins = lazy(() => import('./pages/Plugins.jsx').then((m) => ({ default:
 const DiscordSettings = lazy(() =>
   import('./pages/DiscordSettings.jsx').then((m) => ({ default: m.DiscordSettings })),
 );
+const AdminLayout = lazy(() =>
+  import('./pages/AdminLayout.jsx').then((m) => ({ default: m.AdminLayout })),
+);
+const AdminUsersPage = lazy(() =>
+  import('./pages/AdminUsersPage.jsx').then((m) => ({ default: m.AdminUsersPage })),
+);
+const AdminGroups = lazy(() =>
+  import('./pages/AdminGroups.jsx').then((m) => ({ default: m.AdminGroups })),
+);
+const AdminAbout = lazy(() =>
+  import('./pages/AdminAbout.jsx').then((m) => ({ default: m.AdminAbout })),
+);
+const SetCredentials = lazy(() =>
+  import('./pages/SetCredentials.jsx').then((m) => ({ default: m.SetCredentials })),
+);
 
 /**
  * The "QUORUM" wordmark as standard-figlet ASCII art.
@@ -246,6 +261,9 @@ export function App() {
   const [setupState, setSetupState] = useState(null);
   const [build, setBuild] = useState({ version: '', commit: '', repo: '' });
   const [attestState, setAttestState] = useState(undefined);
+  // Resolved wordmark-animation setting: user preference, else this browser's
+  // choice, else the deployment default (with reduced-motion as default-off).
+  const [asciiAnimation, setAsciiAnimation] = useState(null);
 
   useEffect(() => {
     Promise.all([
@@ -262,6 +280,17 @@ export function App() {
       // choice on any device rather than whatever this browser last used.
       if (me.user?.theme?.skin) setSkin(me.user.theme.skin);
       if (me.user?.theme?.mode) applyMode(me.user.theme.mode);
+
+      // Resolve the wordmark animation: an explicit user or browser preference
+      // wins; otherwise the deployment default, dropped to off when the browser
+      // asks for reduced motion.
+      const stored = localStorage.getItem('quorum-ascii-animation');
+      const storedPref = stored === '1' ? true : stored === '0' ? false : null;
+      const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      const deploymentDefault = me.asciiAnimationDefault !== false;
+      if (typeof me.user?.asciiAnimation === 'boolean') setAsciiAnimation(me.user.asciiAnimation);
+      else if (storedPref !== null) setAsciiAnimation(storedPref);
+      else setAsciiAnimation(deploymentDefault && !reduced);
     });
 
     // The attestation check reaches out to GHCR and GitHub, so it is fetched
@@ -281,6 +310,19 @@ export function App() {
   const saveTheme = (skin, mode) => {
     if (!user) return;
     api('/auth/theme', { method: 'PUT', body: { skin, mode } }).catch(() => {});
+  };
+
+  /**
+   * Toggles the wordmark animation and persists the choice: to the account when
+   * signed in, otherwise to this browser.
+   */
+  const toggleAscii = () => {
+    setAsciiAnimation((prev) => {
+      const next = !prev;
+      if (user) api('/auth/prefs', { method: 'PUT', body: { asciiAnimation: next } }).catch(() => {});
+      else localStorage.setItem('quorum-ascii-animation', next ? '1' : '0');
+      return next;
+    });
   };
 
   // The privacy page is public: someone deciding whether to take part must be
@@ -334,13 +376,25 @@ export function App() {
   return (
     <>
       <header className="topbar">
-        <Link to="/" className="brand" aria-label="Quorum home">
-          {/* The glitch is held still while a survey is being taken, so it does
-              not pull focus from the questions. */}
-          <BrandGlitch still={onSurvey} />
-        </Link>
+        {/* Clicking the wordmark toggles its own animation (an accessibility
+            control). It is held still while a survey is being taken, so it does
+            not pull focus from the questions. */}
+        <button
+          type="button"
+          className="brand brand-toggle"
+          onClick={toggleAscii}
+          title={asciiAnimation === false ? 'Click to animate the wordmark' : 'Click to stop the animation'}
+          aria-label={
+            asciiAnimation === false
+              ? 'Animate the Quorum wordmark'
+              : 'Stop the Quorum wordmark animation'
+          }
+        >
+          <BrandGlitch still={onSurvey || asciiAnimation === false} />
+        </button>
         <nav>
-          {user?.isAdmin ? <Link to="/surveys">Manage surveys</Link> : null}
+          <Link to="/">Home</Link>
+          {user?.isAdmin ? <Link to="/admin/surveys">Manage surveys</Link> : null}
           {user?.isAdmin ? <Link to="/admin">Admin</Link> : null}
           <ThemeControls onChange={saveTheme} />
           {user ? (
@@ -361,19 +415,40 @@ export function App() {
             path="/login"
             element={user ? <Navigate to="/" replace /> : <SignIn devAuthBypass={devAuthBypass} />}
           />
-          {user?.isAdmin ? (
+          {user?.isAdmin && user.mustSetCredentials ? (
             <>
-              <Route path="/admin" element={<AdminSettings />} />
-              <Route path="/surveys" element={<AdminSurveys />} />
+              {/* An admin without a local password must set one before any admin
+                  page renders, so switching to local-only sign-in cannot lock
+                  them out. */}
+              <Route path="/admin/*" element={<SetCredentials user={user} />} />
+              <Route path="/surveys" element={<Navigate to="/admin" replace />} />
+              <Route path="/plugins" element={<Navigate to="/admin" replace />} />
+            </>
+          ) : user?.isAdmin ? (
+            <>
+              {/* Tabbed admin area; each tab is its own deep-linkable route. */}
+              <Route path="/admin" element={<AdminLayout user={user} />}>
+                <Route index element={<Navigate to="surveys" replace />} />
+                <Route path="surveys" element={<AdminSurveys />} />
+                <Route path="users" element={<AdminUsersPage />} />
+                {user.isSuperAdmin ? <Route path="groups" element={<AdminGroups />} /> : null}
+                {user.isSuperAdmin ? <Route path="plugins" element={<Plugins />} /> : null}
+                <Route path="settings" element={<AdminSettings />} />
+                <Route path="about" element={<AdminAbout />} />
+              </Route>
+              {/* Survey detail views are full pages, so they sit outside the tab
+                  layout rather than under it. */}
               <Route path="/admin/surveys/:id" element={<SurveyEditor />} />
               <Route path="/admin/surveys/:id/results" element={<SurveyResults />} />
-              <Route path="/plugins" element={<Plugins />} />
               {/* The Discord wizard is super admins only, enforced server-side
                   too. Reachable while the plugin is off, so a server can be
                   connected before switching it on. */}
               {user.isSuperAdmin ? (
-                <Route path="/plugins/discord" element={<DiscordSettings />} />
+                <Route path="/admin/plugins/discord" element={<DiscordSettings />} />
               ) : null}
+              {/* Old top-level paths still resolve after the move under /admin. */}
+              <Route path="/surveys" element={<Navigate to="/admin/surveys" replace />} />
+              <Route path="/plugins" element={<Navigate to="/admin/plugins" replace />} />
             </>
           ) : null}
           <Route path="*" element={<Navigate to="/" replace />} />
