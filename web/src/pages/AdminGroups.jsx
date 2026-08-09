@@ -1,5 +1,289 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api.js';
+import {
+  findGrant,
+  grantTargets,
+  listGrants,
+  permissionNames,
+  togglePermission,
+} from '../lib/grants.js';
+
+/**
+ * The index of groups, on the left of the first section.
+ *
+ * One line per group and nothing else: picking a line is the only thing that
+ * changes the pane beside it, so the page never shows more than one group's
+ * controls at a time.
+ *
+ * @param {{groups: object[], selectedId: string, onSelect: (id: string) => void}} props
+ * @returns {JSX.Element} The list.
+ */
+function GroupList({ groups, selectedId, onSelect }) {
+  return (
+    <ul className="pick-list">
+      {groups.map((group) => {
+        const current = group.id === selectedId;
+        return (
+          <li key={group.id}>
+            <button
+              type="button"
+              className="pick-item"
+              // aria-current announces the selection, and the marker column
+              // shows it without relying on the highlight colour.
+              aria-current={current ? 'true' : undefined}
+              onClick={() => onSelect(group.id)}
+            >
+              <span className="pick-mark" aria-hidden="true">
+                {current ? '▸' : ''}
+              </span>
+              <span className="pick-body">
+                <span className="pick-name">{group.name}</span>
+                <span className="pick-meta">
+                  {group.members.length} member{group.members.length === 1 ? '' : 's'}
+                  {group.isDefault ? ' · Default' : ''}
+                </span>
+              </span>
+            </button>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+/**
+ * Everything about the one selected group: its name, what its members may do,
+ * who they are, and removing it.
+ *
+ * Mounted with the group's id as its key, so switching group resets the fields
+ * rather than carrying a half-typed rename across.
+ *
+ * @param {{group: object, admins: object[], catalogue: object[], busy: boolean,
+ *   onRename: (name: string) => void, onMakeDefault: () => void,
+ *   onDelete: () => void, onTogglePermission: (key: string) => void,
+ *   onAddMember: (userId: string) => Promise<void>,
+ *   onRemoveMember: (member: object) => void}} props
+ * @returns {JSX.Element} The detail pane.
+ */
+function GroupDetail({
+  group,
+  admins,
+  catalogue,
+  busy,
+  onRename,
+  onMakeDefault,
+  onDelete,
+  onTogglePermission,
+  onAddMember,
+  onRemoveMember,
+}) {
+  const [name, setName] = useState(group.name);
+  const [memberId, setMemberId] = useState('');
+  const [confirming, setConfirming] = useState(false);
+
+  const memberIds = new Set(group.members.map((member) => member.id));
+  const assignable = admins.filter((admin) => !memberIds.has(admin.id));
+  const renamed = name.trim() && name.trim() !== group.name;
+
+  return (
+    <section className="split-main" aria-labelledby="group-detail-name">
+      <div className="row">
+        <h3 id="group-detail-name" style={{ margin: 0 }}>
+          {group.name}
+        </h3>
+        {group.isDefault ? <span className="badge">Default</span> : null}
+        <span style={{ marginLeft: 'auto' }} />
+        {group.isDefault ? null : (
+          <button type="button" onClick={onMakeDefault} disabled={busy}>
+            Make default
+          </button>
+        )}
+        {group.isDefault ? null : (
+          <button type="button" className="danger" onClick={() => setConfirming(true)}>
+            Delete
+          </button>
+        )}
+      </div>
+
+      <label htmlFor="group-name" style={{ marginTop: '0.75rem', marginBottom: '0.25rem' }}>
+        <span className="field-label">Name</span>
+      </label>
+      <div className="row">
+        <input
+          id="group-name"
+          type="text"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && renamed && onRename(name.trim())}
+          style={{ flex: 1 }}
+        />
+        <button type="button" onClick={() => onRename(name.trim())} disabled={busy || !renamed}>
+          Save name
+        </button>
+      </div>
+
+      <h4>Members can</h4>
+      <p className="muted" style={{ fontSize: '0.82rem', marginTop: 0 }}>
+        Applies to surveys this group owns.
+      </p>
+      {catalogue.map((entry) => (
+        <label className="option-row" key={entry.key}>
+          <input
+            type="checkbox"
+            checked={group.memberPermissions.includes(entry.key)}
+            disabled={busy}
+            onChange={() => onTogglePermission(entry.key)}
+          />
+          <span>
+            {entry.label}
+            <br />
+            <span className="muted" style={{ fontSize: '0.8rem' }}>
+              {entry.detail}
+            </span>
+          </span>
+        </label>
+      ))}
+
+      <h4>Members</h4>
+      {group.members.length === 0 ? (
+        <p className="muted" style={{ fontSize: '0.85rem', marginTop: 0 }}>
+          No members yet.
+        </p>
+      ) : (
+        <table className="chart-table">
+          <tbody>
+            {group.members.map((member) => (
+              <tr key={member.id}>
+                <th scope="row" style={{ display: 'table-cell' }}>
+                  {member.displayName || member.username}
+                  {member.tier === 'super_admin' ? (
+                    <span className="badge" style={{ marginLeft: '0.5rem' }}>
+                      Super administrator
+                    </span>
+                  ) : null}
+                </th>
+                <td style={{ textAlign: 'right' }}>
+                  <button
+                    type="button"
+                    onClick={() => onRemoveMember(member)}
+                    disabled={busy}
+                    aria-label={`Remove ${member.displayName || member.username} from ${group.name}`}
+                  >
+                    Remove
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      <div className="row" style={{ marginTop: '0.5rem' }}>
+        <select
+          value={memberId}
+          aria-label={`Add an admin to ${group.name}`}
+          onChange={(e) => setMemberId(e.target.value)}
+          style={{ flex: 1 }}
+          disabled={assignable.length === 0}
+        >
+          <option value="">
+            {assignable.length === 0 ? 'Every admin is already a member' : 'Add an admin...'}
+          </option>
+          {assignable.map((admin) => (
+            <option key={admin.id} value={admin.id}>
+              {admin.displayName || admin.username}
+              {admin.tier === 'super_admin' ? ' (super)' : ''}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          disabled={busy || !memberId}
+          onClick={async () => {
+            await onAddMember(memberId);
+            setMemberId('');
+          }}
+        >
+          Add
+        </button>
+      </div>
+      {group.members.some((member) => member.tier === 'super_admin') ? (
+        <p className="muted" style={{ fontSize: '0.8rem' }}>
+          Super administrators already have every permission everywhere; membership does not change
+          what they can do.
+        </p>
+      ) : null}
+
+      {confirming ? (
+        <div className="confirm">
+          <h3>Delete this group?</h3>
+          <p>
+            Its surveys will be reassigned to the default group, and its members and grants removed.
+            This cannot be undone.
+          </p>
+          <div className="row">
+            <button type="button" onClick={() => setConfirming(false)}>
+              Cancel
+            </button>
+            <button type="button" className="danger" onClick={onDelete}>
+              Delete &ldquo;{group.name}&rdquo;
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+/**
+ * The grants that already exist, one line each.
+ *
+ * Only pairs that actually hold a grant appear, so this is as long as the
+ * access really is rather than as long as the group count squared.
+ *
+ * @param {{rows: object[], catalogue: object[], busy: boolean,
+ *   onEdit: (row: object) => void, onRemove: (row: object) => void}} props
+ * @returns {JSX.Element} The list, or an empty state.
+ */
+function GrantList({ rows, catalogue, busy, onEdit, onRemove }) {
+  if (rows.length === 0) {
+    return <p className="empty">No group has access to another group&rsquo;s surveys yet.</p>;
+  }
+
+  return (
+    <ul className="grant-list">
+      {rows.map((row) => (
+        <li className="grant-row" key={`${row.sourceId}:${row.targetId}`}>
+          <span className="grant-pair">
+            <strong>{row.sourceName}</strong> <span className="muted">can access</span>{' '}
+            <strong>{row.targetName}</strong>
+          </span>
+          <span className="grant-perms muted">
+            {permissionNames(catalogue, row.permissions).join(', ')}
+          </span>
+          <span className="grant-actions">
+            <button
+              type="button"
+              onClick={() => onEdit(row)}
+              aria-label={`Edit ${row.sourceName}'s access to ${row.targetName}`}
+            >
+              Edit
+            </button>
+            <button
+              type="button"
+              className="danger"
+              disabled={busy}
+              onClick={() => onRemove(row)}
+              aria-label={`Remove ${row.sourceName}'s access to ${row.targetName}`}
+            >
+              Remove
+            </button>
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 /**
  * Group management, super admins only.
@@ -8,6 +292,12 @@ import { api } from '../api.js';
  * permissions over another group's surveys. The default group is renamable but
  * cannot be deleted, and there is always exactly one.
  *
+ * The page is two sections, each reading left to right. The first picks one
+ * group and shows only that group's controls; the second is a single sentence
+ * that grants one group access to another, over a list of the grants that
+ * exist. Nothing else is expanded, so the page grows with the number of groups
+ * rather than with the number of pairs of groups.
+ *
  * Every change is saved immediately and the list reloaded, so what is shown is
  * always what the server holds.
  *
@@ -15,11 +305,10 @@ import { api } from '../api.js';
  */
 export function AdminGroups() {
   const [data, setData] = useState(null);
+  const [selectedId, setSelectedId] = useState(null);
   const [name, setName] = useState('');
-  const [renaming, setRenaming] = useState(null);
-  const [renameValue, setRenameValue] = useState('');
-  const [addMember, setAddMember] = useState({});
-  const [confirmDelete, setConfirmDelete] = useState(null);
+  // The one pair being granted or edited in section 2.
+  const [grant, setGrant] = useState({ sourceId: '', targetId: '', permissions: [] });
   const [error, setError] = useState(null);
   const [status, setStatus] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -54,85 +343,156 @@ export function AdminGroups() {
     }
   };
 
-  /** Creates a group. */
+  if (!data) {
+    return (
+      <div className="shell">
+        {error ? <div className="error">{error}</div> : <p className="muted">Loading...</p>}
+      </div>
+    );
+  }
+
+  const { groups, admins, catalogue } = data;
+  // The selection is derived rather than stored, so deleting the selected group
+  // falls back to the default instead of leaving the pane pointing at nothing.
+  const selected =
+    groups.find((group) => group.id === selectedId) ??
+    groups.find((group) => group.isDefault) ??
+    groups[0] ??
+    null;
+
+  const existing = findGrant(groups, grant.sourceId, grant.targetId);
+  const grantRows = listGrants(groups);
+
+  /** Creates a group and selects it. */
   const create = () =>
     run(async () => {
-      await api('/admin/groups', { method: 'POST', body: { name: name.trim() } });
+      const created = await api('/admin/groups', { method: 'POST', body: { name: name.trim() } });
       setName('');
+      if (created?.id) setSelectedId(created.id);
     }, 'Group created.');
 
   /**
-   * Toggles one of a group's member permissions.
+   * Renames the selected group.
    *
-   * @param {object} group The group.
+   * @param {string} next The new name.
+   */
+  const rename = (next) =>
+    run(() => api(`/admin/groups/${selected.id}`, { method: 'PATCH', body: { name: next } }),
+      'Group renamed.');
+
+  /** Makes the selected group the default. */
+  const makeDefault = () =>
+    run(() => api(`/admin/groups/${selected.id}`, { method: 'PATCH', body: { isDefault: true } }),
+      `${selected.name} is now the default group.`);
+
+  /**
+   * Toggles one of the selected group's member permissions.
+   *
    * @param {string} key The permission key.
    */
-  const toggleMemberPermission = (group, key) => {
-    const next = group.memberPermissions.includes(key)
-      ? group.memberPermissions.filter((p) => p !== key)
-      : [...group.memberPermissions, key];
-    return run(() =>
-      api(`/admin/groups/${group.id}`, { method: 'PATCH', body: { memberPermissions: next } }),
+  const toggleMemberPermission = (key) =>
+    run(() =>
+      api(`/admin/groups/${selected.id}`, {
+        method: 'PATCH',
+        body: { memberPermissions: togglePermission(selected.memberPermissions, key) },
+      }),
     );
+
+  /**
+   * Adds an admin to the selected group.
+   *
+   * @param {string} userId The admin to add.
+   */
+  const addMember = (userId) =>
+    run(() =>
+      api(`/admin/groups/${selected.id}/members`, { method: 'POST', body: { userId } }),
+    );
+
+  /**
+   * Removes an admin from the selected group.
+   *
+   * @param {object} member The member to remove.
+   */
+  const removeMember = (member) =>
+    run(() =>
+      api(`/admin/groups/${selected.id}/members/${member.id}`, { method: 'DELETE' }),
+    );
+
+  /** Deletes the selected group, reassigning its surveys to the default. */
+  const destroy = () => {
+    const removedId = selected.id;
+    return run(async () => {
+      await api(`/admin/groups/${removedId}`, { method: 'DELETE' });
+      setSelectedId(null);
+      // Its grants cascade away with it, so drop it from the sentence row too
+      // rather than leaving a select pointing at a group that is gone.
+      setGrant((current) =>
+        current.sourceId === removedId || current.targetId === removedId
+          ? { sourceId: '', targetId: '', permissions: [] }
+          : current,
+      );
+    }, `Removed ${selected.name}.`);
   };
 
   /**
-   * Toggles one permission of the grant this group holds over another.
+   * Chooses the group being given access, loading whatever that pair already
+   * holds so the same row edits as well as creates.
    *
-   * @param {object} group The source group.
-   * @param {string} targetGroupId The group whose surveys are granted.
-   * @param {string} key The permission key.
+   * @param {string} sourceId The source group.
    */
-  const toggleGrant = (group, targetGroupId, key) => {
-    const existing = group.grants.find((g) => g.targetGroupId === targetGroupId);
-    const current = existing?.permissions ?? [];
-    const next = current.includes(key) ? current.filter((p) => p !== key) : [...current, key];
-    return run(() =>
-      api(`/admin/groups/${group.id}/grants`, {
-        method: 'PUT',
-        body: { targetGroupId, permissions: next },
-      }),
-    );
-  };
-
-  /** Saves an in-progress rename. */
-  const saveRename = (group) =>
-    run(async () => {
-      await api(`/admin/groups/${group.id}`, { method: 'PATCH', body: { name: renameValue.trim() } });
-      setRenaming(null);
-    }, 'Group renamed.');
-
-  /** Makes a group the default. */
-  const makeDefault = (group) =>
-    run(() => api(`/admin/groups/${group.id}`, { method: 'PATCH', body: { isDefault: true } }),
-      `${group.name} is now the default group.`);
-
-  /** Adds the selected admin to a group. */
-  const addToGroup = (group) => {
-    const userId = addMember[group.id];
-    if (!userId) return undefined;
-    return run(async () => {
-      await api(`/admin/groups/${group.id}/members`, { method: 'POST', body: { userId } });
-      setAddMember((m) => ({ ...m, [group.id]: '' }));
+  const chooseSource = (sourceId) =>
+    setGrant((current) => {
+      // A group is never offered access to itself, so a target that has just
+      // become the source is dropped.
+      const targetId = current.targetId === sourceId ? '' : current.targetId;
+      return { sourceId, targetId, permissions: findGrant(groups, sourceId, targetId) ?? [] };
     });
-  };
 
-  /** Removes an admin from a group. */
-  const removeMember = (group, member) =>
-    run(() =>
-      api(`/admin/groups/${group.id}/members/${member.id}`, { method: 'DELETE' }),
+  /**
+   * Chooses the group whose surveys are reached.
+   *
+   * @param {string} targetId The target group.
+   */
+  const chooseTarget = (targetId) =>
+    setGrant((current) => ({
+      ...current,
+      targetId,
+      permissions: findGrant(groups, current.sourceId, targetId) ?? [],
+    }));
+
+  /**
+   * Writes the sentence row's pair. An empty permission list clears the grant,
+   * which is how the API removes one.
+   */
+  const saveGrant = () =>
+    run(
+      () =>
+        api(`/admin/groups/${grant.sourceId}/grants`, {
+          method: 'PUT',
+          body: { targetGroupId: grant.targetId, permissions: grant.permissions },
+        }),
+      grant.permissions.length === 0 ? 'Access removed.' : 'Access saved.',
     );
 
-  /** Deletes a group, reassigning its surveys to the default. */
-  const destroy = (group) =>
+  /**
+   * Clears one existing grant.
+   *
+   * @param {object} row The listed grant.
+   */
+  const removeGrant = (row) =>
     run(async () => {
-      await api(`/admin/groups/${group.id}`, { method: 'DELETE' });
-      setConfirmDelete(null);
-    }, `Removed ${group.name}.`);
-
-  if (!data) return <div className="shell muted">Loading...</div>;
-
-  const label = (key) => data.catalogue.find((c) => c.key === key)?.label ?? key;
+      await api(`/admin/groups/${row.sourceId}/grants`, {
+        method: 'PUT',
+        body: { targetGroupId: row.targetId, permissions: [] },
+      });
+      // If that pair is loaded in the row above, empty it too rather than
+      // leaving ticks for access that no longer exists.
+      setGrant((current) =>
+        current.sourceId === row.sourceId && current.targetId === row.targetId
+          ? { ...current, permissions: [] }
+          : current,
+      );
+    }, `${row.sourceName} no longer has access to ${row.targetName}.`);
 
   return (
     <div className="shell">
@@ -147,215 +507,156 @@ export function AdminGroups() {
       {status ? <p className="muted">{status}</p> : null}
 
       <div className="card">
-        <div className="row">
-          <input
-            type="text"
-            placeholder="New group name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && name.trim() && create()}
-            style={{ flex: 1 }}
-          />
-          <button type="button" className="primary" onClick={create} disabled={busy || !name.trim()}>
-            Create group
-          </button>
+        <h2>What a group can do</h2>
+        <p className="muted" style={{ fontSize: '0.85rem' }}>
+          Pick a group on the left. Everything on the right belongs to that group alone.
+        </p>
+
+        <div className="split">
+          <div className="split-side">
+            <GroupList groups={groups} selectedId={selected?.id} onSelect={setSelectedId} />
+            <div className="row" style={{ marginTop: '0.75rem' }}>
+              <input
+                type="text"
+                aria-label="New group name"
+                placeholder="New group name"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && name.trim() && create()}
+                style={{ flex: 1, minWidth: '8rem' }}
+              />
+              <button type="button" className="primary" onClick={create} disabled={busy || !name.trim()}>
+                Create
+              </button>
+            </div>
+          </div>
+
+          {selected ? (
+            <GroupDetail
+              key={selected.id}
+              group={selected}
+              admins={admins}
+              catalogue={catalogue}
+              busy={busy}
+              onRename={rename}
+              onMakeDefault={makeDefault}
+              onDelete={destroy}
+              onTogglePermission={toggleMemberPermission}
+              onAddMember={addMember}
+              onRemoveMember={removeMember}
+            />
+          ) : (
+            <p className="empty split-main">Create a group to get started.</p>
+          )}
         </div>
       </div>
 
-      {data.groups.map((group) => {
-        const memberIds = new Set(group.members.map((m) => m.id));
-        const assignable = data.admins.filter((a) => !memberIds.has(a.id));
-        const otherGroups = data.groups.filter((g) => g.id !== group.id);
+      <div className="card">
+        <h2>Access between groups</h2>
+        <p className="muted" style={{ fontSize: '0.85rem' }}>
+          Read it as a sentence: one group can do these things to another group&rsquo;s surveys.
+          Choosing a pair that already has access loads it here for editing.
+        </p>
 
-        return (
-          <div className="card" key={group.id}>
-            <div className="row">
-              {renaming === group.id ? (
-                <>
-                  <input
-                    type="text"
-                    value={renameValue}
-                    onChange={(e) => setRenameValue(e.target.value)}
-                    style={{ flex: 1 }}
-                  />
-                  <button
-                    type="button"
-                    className="primary"
-                    onClick={() => saveRename(group)}
-                    disabled={busy || !renameValue.trim()}
-                  >
-                    Save
-                  </button>
-                  <button type="button" onClick={() => setRenaming(null)}>
-                    Cancel
-                  </button>
-                </>
-              ) : (
-                <>
-                  <h2 style={{ margin: 0 }}>{group.name}</h2>
-                  {group.isDefault ? <span className="badge">Default</span> : null}
-                  <span style={{ marginLeft: 'auto' }} />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setRenaming(group.id);
-                      setRenameValue(group.name);
-                    }}
-                  >
-                    Rename
-                  </button>
-                  {group.isDefault ? null : (
-                    <button type="button" onClick={() => makeDefault(group)} disabled={busy}>
-                      Make default
-                    </button>
-                  )}
-                  {group.isDefault ? null : (
-                    <button
-                      type="button"
-                      className="danger"
-                      onClick={() => setConfirmDelete(group.id)}
-                    >
-                      Delete
-                    </button>
-                  )}
-                </>
-              )}
-            </div>
-
-            <h3 style={{ marginBottom: '0.2rem' }}>What members can do</h3>
-            <p className="muted" style={{ fontSize: '0.82rem', marginTop: 0 }}>
-              Applies to surveys this group owns.
-            </p>
-            {data.catalogue.map((entry) => (
-              <label className="option-row" key={entry.key}>
-                <input
-                  type="checkbox"
-                  checked={group.memberPermissions.includes(entry.key)}
-                  disabled={busy}
-                  onChange={() => toggleMemberPermission(group, entry.key)}
-                />
-                <span>
-                  {entry.label}
-                  <br />
-                  <span className="muted" style={{ fontSize: '0.8rem' }}>{entry.detail}</span>
-                </span>
-              </label>
-            ))}
-
-            <h3 style={{ marginBottom: '0.2rem' }}>Members</h3>
-            {group.members.length === 0 ? (
-              <p className="muted" style={{ fontSize: '0.85rem', marginTop: 0 }}>No members yet.</p>
-            ) : (
-              <table className="chart-table">
-                <tbody>
-                  {group.members.map((member) => (
-                    <tr key={member.id}>
-                      <th scope="row" style={{ display: 'table-cell' }}>
-                        {member.displayName || member.username}
-                        {member.tier === 'super_admin' ? (
-                          <span className="badge" style={{ marginLeft: '0.5rem' }}>
-                            Super administrator
-                          </span>
-                        ) : null}
-                      </th>
-                      <td style={{ textAlign: 'right' }}>
-                        <button type="button" onClick={() => removeMember(group, member)} disabled={busy}>
-                          Remove
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-
-            <div className="row" style={{ marginTop: '0.5rem' }}>
+        {groups.length < 2 ? (
+          <p className="empty">
+            Access between groups needs a second group; there is only one so far.
+          </p>
+        ) : (
+          <>
+            <div className="sentence">
               <select
-                value={addMember[group.id] ?? ''}
-                onChange={(e) => setAddMember((m) => ({ ...m, [group.id]: e.target.value }))}
-                style={{ flex: 1 }}
-                disabled={assignable.length === 0}
+                className="sentence-select"
+                aria-label="Group being given access"
+                value={grant.sourceId}
+                onChange={(e) => chooseSource(e.target.value)}
               >
-                <option value="">
-                  {assignable.length === 0 ? 'Every admin is already a member' : 'Add an admin...'}
-                </option>
-                {assignable.map((admin) => (
-                  <option key={admin.id} value={admin.id}>
-                    {admin.displayName || admin.username}
-                    {admin.tier === 'super_admin' ? ' (super)' : ''}
+                <option value="">Choose a group...</option>
+                {groups.map((group) => (
+                  <option key={group.id} value={group.id}>
+                    {group.name}
                   </option>
                 ))}
               </select>
+
+              <span className="sentence-word">can</span>
+
+              <div className="chip-set" role="group" aria-label="Permissions granted">
+                {catalogue.map((entry) => {
+                  const on = grant.permissions.includes(entry.key);
+                  return (
+                    <label className={on ? 'chip chip-on' : 'chip'} key={entry.key}>
+                      <input
+                        type="checkbox"
+                        checked={on}
+                        disabled={busy || !grant.sourceId || !grant.targetId}
+                        onChange={() =>
+                          setGrant((current) => ({
+                            ...current,
+                            permissions: togglePermission(current.permissions, entry.key),
+                          }))
+                        }
+                      />
+                      <span>{entry.label}</span>
+                    </label>
+                  );
+                })}
+              </div>
+
+              <span className="sentence-word">on</span>
+
+              <select
+                className="sentence-select"
+                aria-label="Group whose surveys are reached"
+                value={grant.targetId}
+                onChange={(e) => chooseTarget(e.target.value)}
+              >
+                <option value="">Choose a group...</option>
+                {grantTargets(groups, grant.sourceId).map((group) => (
+                  <option key={group.id} value={group.id}>
+                    {group.name}
+                  </option>
+                ))}
+              </select>
+
               <button
                 type="button"
-                onClick={() => addToGroup(group)}
-                disabled={busy || !addMember[group.id]}
+                className="primary"
+                onClick={saveGrant}
+                disabled={
+                  busy ||
+                  !grant.sourceId ||
+                  !grant.targetId ||
+                  (!existing && grant.permissions.length === 0)
+                }
               >
-                Add
+                {existing ? 'Update' : 'Grant'}
               </button>
             </div>
-            {group.members.some((m) => m.tier === 'super_admin') ? (
-              <p className="muted" style={{ fontSize: '0.8rem' }}>
-                Super administrators already have every permission everywhere; membership does not
-                change what they can do.
+
+            {existing && grant.permissions.length === 0 ? (
+              <p className="muted" style={{ fontSize: '0.82rem' }}>
+                Updating with nothing ticked removes this access.
               </p>
             ) : null}
 
-            {otherGroups.length > 0 ? (
-              <>
-                <h3 style={{ marginBottom: '0.2rem' }}>Access to other groups&rsquo; surveys</h3>
-                <p className="muted" style={{ fontSize: '0.82rem', marginTop: 0 }}>
-                  Tick what this group&rsquo;s members may do to another group&rsquo;s surveys.
-                </p>
-                {otherGroups.map((target) => {
-                  const grant = group.grants.find((g) => g.targetGroupId === target.id);
-                  const granted = grant?.permissions ?? [];
-                  return (
-                    <div key={target.id} style={{ marginBottom: '0.5rem' }}>
-                      <strong style={{ fontSize: '0.9rem' }}>{target.name}</strong>
-                      <div style={{ marginLeft: '1rem' }}>
-                        {data.catalogue.map((entry) => (
-                          <label
-                            className="option-row"
-                            key={entry.key}
-                            style={{ padding: '0.25rem 0' }}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={granted.includes(entry.key)}
-                              disabled={busy}
-                              onChange={() => toggleGrant(group, target.id, entry.key)}
-                            />
-                            <span style={{ fontSize: '0.85rem' }}>{label(entry.key)}</span>
-                          </label>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                })}
-              </>
-            ) : null}
-
-            {confirmDelete === group.id ? (
-              <div className="confirm">
-                <h3>Delete this group?</h3>
-                <p>
-                  Its surveys will be reassigned to the default group, and its members and grants
-                  removed. This cannot be undone.
-                </p>
-                <div className="row">
-                  <button type="button" onClick={() => setConfirmDelete(null)}>
-                    Cancel
-                  </button>
-                  <button type="button" className="danger" onClick={() => destroy(group)}>
-                    Delete &ldquo;{group.name}&rdquo;
-                  </button>
-                </div>
-              </div>
-            ) : null}
-          </div>
-        );
-      })}
+            <h4>Access that exists</h4>
+            <GrantList
+              rows={grantRows}
+              catalogue={catalogue}
+              busy={busy}
+              onEdit={(row) =>
+                setGrant({
+                  sourceId: row.sourceId,
+                  targetId: row.targetId,
+                  permissions: [...row.permissions],
+                })
+              }
+              onRemove={removeGrant}
+            />
+          </>
+        )}
+      </div>
     </div>
   );
 }
