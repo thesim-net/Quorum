@@ -4,6 +4,7 @@ import {
   accessibleGroupIds,
   effectivePermissionsForGroup,
   membershipWithFallback,
+  unionOfPermissions,
 } from './groupPermissions.js';
 import { ALL_PERMISSIONS, TIERS } from './permissionSet.js';
 
@@ -79,6 +80,20 @@ test('fallback-to-default: an admin in no group is treated as a default member',
   assert.deepEqual([...perms], ['results.read']);
 });
 
+test('fallback-to-default: an admin in no group is the only thing standing in for one', () => {
+  // There is no per-user permission list left to fall back to, so an admin
+  // created without a group gets exactly what the default group grants, over
+  // the default group's surveys and nothing else.
+  const defaultGroup = { id: 'default', memberPermissions: ['surveys.write', 'results.read'] };
+  const membership = membershipWithFallback(admin, [], defaultGroup);
+
+  assert.deepEqual(
+    [...effectivePermissionsForGroup(admin, 'default', membership, [])].sort(),
+    ['results.read', 'surveys.write'],
+  );
+  assert.equal(effectivePermissionsForGroup(admin, A, membership, []).size, 0);
+});
+
 test('fallback-to-default: an admin who already has a group is left unchanged', () => {
   const defaultGroup = { id: 'default', memberPermissions: ALL_PERMISSIONS };
   const membership = [{ groupId: A, memberPermissions: ['surveys.write'] }];
@@ -88,4 +103,43 @@ test('fallback-to-default: an admin who already has a group is left unchanged', 
 test('fallback-to-default: super admins are never given a synthetic membership', () => {
   const defaultGroup = { id: 'default', memberPermissions: ALL_PERMISSIONS };
   assert.deepEqual(membershipWithFallback(superAdmin, [], defaultGroup), []);
+});
+
+test('the union is what the caller holds across all their groups', () => {
+  // What /admin/me reports: enough to know which buttons are worth drawing.
+  const membership = [
+    { groupId: A, memberPermissions: ['surveys.write'] },
+    { groupId: B, memberPermissions: ['surveys.publish'] },
+  ];
+  const perms = unionOfPermissions(admin, membership, []);
+  assert.deepEqual([...perms].sort(), ['surveys.publish', 'surveys.write']);
+});
+
+test('the union counts permissions reached through a grant', () => {
+  const membership = [{ groupId: A, memberPermissions: ['surveys.write'] }];
+  const grants = [{ sourceGroupId: A, targetGroupId: B, permissions: ['results.read'] }];
+  assert.deepEqual(
+    [...unionOfPermissions(admin, membership, grants)].sort(),
+    ['results.read', 'surveys.write'],
+  );
+});
+
+test('the union ignores grants held by groups the caller is not in', () => {
+  const membership = [{ groupId: A, memberPermissions: [] }];
+  const grants = [{ sourceGroupId: C, targetGroupId: A, permissions: ['surveys.delete'] }];
+  assert.equal(unionOfPermissions(admin, membership, grants).size, 0);
+});
+
+test('the union is never authorisation: it says "somewhere", not "here"', () => {
+  // Holding surveys.delete over B must not read as holding it over A. This is
+  // the whole reason the union is advisory and requireSurveyPermission is not.
+  const membership = [{ groupId: A, memberPermissions: [] }];
+  const grants = [{ sourceGroupId: A, targetGroupId: B, permissions: ['surveys.delete'] }];
+
+  assert.deepEqual([...unionOfPermissions(admin, membership, grants)], ['surveys.delete']);
+  assert.equal(effectivePermissionsForGroup(admin, A, membership, grants).size, 0);
+});
+
+test('a super admin\'s union is every permission, with no membership', () => {
+  assert.deepEqual([...unionOfPermissions(superAdmin, [], [])].sort(), [...ALL_PERMISSIONS].sort());
 });

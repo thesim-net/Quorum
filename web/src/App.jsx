@@ -436,7 +436,11 @@ export function App() {
                 <Route index element={<Navigate to="surveys" replace />} />
                 <Route path="surveys" element={<AdminSurveys />} />
                 <Route path="users" element={<AdminUsersPage />} />
-                {user.isSuperAdmin ? <Route path="groups" element={<AdminGroups />} /> : null}
+                {/* Also for anybody who administers a group: the page shows
+                    them their own groups, and the API sends nothing else. */}
+                {user.isSuperAdmin || user.administersAGroup ? (
+                  <Route path="groups" element={<AdminGroups />} />
+                ) : null}
                 {user.isSuperAdmin ? <Route path="plugins" element={<Plugins />} /> : null}
                 <Route path="settings" element={<AdminSettings />} />
                 <Route path="about" element={<AdminAbout />} />

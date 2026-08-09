@@ -6,7 +6,7 @@ import { hashPassword, verifyPassword } from '../lib/passwords.js';
 import { onboardingState } from '../lib/onboarding.js';
 import { current, effectiveAuthMethods } from '../lib/settings.js';
 import { PLUGINS, isPluginEnabled } from '../lib/plugins.js';
-import { TIERS, sanitisePermissions } from '../lib/permissionSet.js';
+import { TIERS } from '../lib/permissionSet.js';
 import { endSession, requireMember, startSession } from '../middleware/session.js';
 import { challengeRequired, issueChallenge } from '../plugins/twofactor/twofactor.js';
 
@@ -225,15 +225,14 @@ if (config.devAuthBypass) {
       // note the bypass itself also forces super admin at request time.
       const tier = req.body?.admin === false ? TIERS.NONE : TIERS.SUPER;
       const { rows } = await query(
-        `INSERT INTO users (discord_id, username, display_name, tier, permissions, last_login_at)
-              VALUES ($1, $2, $3, $4, $5, now())
+        `INSERT INTO users (discord_id, username, display_name, tier, last_login_at)
+              VALUES ($1, $2, $3, $4, now())
          ON CONFLICT (discord_id) DO UPDATE
               SET username = EXCLUDED.username,
                   tier = EXCLUDED.tier,
-                  permissions = EXCLUDED.permissions,
                   last_login_at = now()
            RETURNING id`,
-        [discordId, username, username, tier, sanitisePermissions(req.body?.permissions)],
+        [discordId, username, username, tier],
       );
 
       await startSession(res, { id: rows[0].id }, []);
@@ -316,6 +315,9 @@ authRouter.get('/me', (req, res) => {
       onboardingSteps: onboarding.steps,
       isAdmin: req.user.isAdmin,
       isSuperAdmin: req.user.isSuperAdmin,
+      // Whether any of their memberships administers its group, so the panel
+      // can offer the Groups tab. WHICH group is never decided from here.
+      administersAGroup: req.user.administersAGroup,
       tier: req.user.tier,
       // The saved skin/mode, so it is applied on sign-in from any device.
       theme: req.user.prefs?.theme ?? null,
