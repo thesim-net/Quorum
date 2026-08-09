@@ -882,6 +882,27 @@ select[multiple] {
   table-layout: fixed;
 }
 
+/* A row of actions belonging to the row above it. The buttons wrap instead of
+   running off the page, and the pair reads as one entry: the account's own row
+   loses its rule so the border falls below the actions rather than between
+   them. */
+.chart-table tr.row-actions > td {
+  padding-top: 0.15rem;
+  padding-bottom: 0.6rem;
+}
+
+.chart-table tr:has(+ tr.row-actions) > th,
+.chart-table tr:has(+ tr.row-actions) > td {
+  border-bottom: none;
+}
+
+.row-actions .row-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+}
+
 /* Cards sit in flex and grid contexts, where the default minimum size lets wide
    content push them out of their container; this keeps them inside it.
    Deliberately NOT applied to .shell: doing so overrides the page width set
