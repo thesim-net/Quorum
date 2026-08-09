@@ -10,6 +10,8 @@ import { adminRouter } from './routes/admin.js';
 import { authRouter } from './routes/auth.js';
 import { setupRouter } from './routes/setup.js';
 import { surveyRouter } from './routes/surveys.js';
+import { discordAdminRouter, discordAuthRouter } from './plugins/discord/routes.js';
+import { twofactorAdminRouter, twofactorAuthRouter } from './plugins/twofactor/routes.js';
 import { loadSession } from './middleware/session.js';
 import { ensureSetupTokenIfNeeded, loadSettings, current } from './lib/settings.js';
 import { startScheduler } from './lib/scheduler.js';
@@ -55,6 +57,20 @@ app.use(
 app.use(loadSession());
 
 app.use('/api/auth', authRouter);
+// Auth plugins hang their sign-in routes under the same rate-limited prefix:
+// the twofactor challenge at /api/auth/2fa, Discord OAuth at /api/auth/discord.
+app.use('/api/auth', twofactorAuthRouter);
+app.use('/api/auth/discord', discordAuthRouter);
+app.use(
+  '/api/plugin/discord',
+  rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: 'draft-7', legacyHeaders: false }),
+  discordAdminRouter,
+);
+app.use(
+  '/api/plugin/twofactor',
+  rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false }),
+  twofactorAdminRouter,
+);
 app.use(
   '/api/setup',
   rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false }),

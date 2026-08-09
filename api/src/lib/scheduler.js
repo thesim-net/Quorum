@@ -1,8 +1,8 @@
 import { config } from '../config.js';
 import { query } from '../db/pool.js';
-import * as discord from './discord.js';
 import { PLUGINS, isPluginEnabled } from './plugins.js';
 import { current } from './settings.js';
+import { postMessage } from '../plugins/discord/discord.js';
 
 /**
  * Posts "closing soon" reminders for surveys whose window is nearly up.
@@ -14,7 +14,11 @@ import { current } from './settings.js';
  * @returns {Promise<void>}
  */
 export async function runReminders() {
-  if (!isPluginEnabled(current().plugins, PLUGINS.REMINDERS)) return;
+  const settings = current();
+  if (!isPluginEnabled(settings.plugins, PLUGINS.REMINDERS)) return;
+  // Posting is the discord plugin's transport; without it there is nowhere to
+  // post, whatever the reminder configuration says.
+  if (!isPluginEnabled(settings.plugins, PLUGINS.DISCORD) || !settings.discord.configured) return;
 
   const { rows } = await query(
     `SELECT id, slug, title, plugin_config
@@ -34,7 +38,7 @@ export async function runReminders() {
     try {
       const url = `${config.publicUrl}/s/${survey.slug}`;
       const hours = survey.plugin_config.remindHoursBeforeClose;
-      await discord.postMessage(
+      await postMessage(
         survey.plugin_config.announceChannelId,
         `**Reminder: ${survey.title} closes soon**\n` +
           `Closing within ${hours} hour(s). Take it here: ${url}`,

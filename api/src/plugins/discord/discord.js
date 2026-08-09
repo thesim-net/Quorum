@@ -1,4 +1,4 @@
-import { config } from '../config.js';
+import { config } from '../../config.js';
 import { requireDiscord } from './settings.js';
 
 const API = 'https://discord.com/api/v10';

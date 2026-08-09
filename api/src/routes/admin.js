@@ -1,9 +1,8 @@
 import { Router } from 'express';
 import { config } from '../config.js';
 import { query, transaction } from '../db/pool.js';
-import * as discord from '../lib/discord.js';
-import { guildMetadata, invalidateGuildCache } from '../lib/gate.js';
-import { current, savePlugins } from '../lib/settings.js';
+import { generatePassword, hashPassword } from '../lib/passwords.js';
+import { current, effectiveAuthMethods, saveAuthMethods, savePlugins } from '../lib/settings.js';
 import {
   aggregateRanking,
   categorise,
@@ -27,6 +26,8 @@ import {
   TIERS,
   sanitisePermissions,
 } from '../lib/permissionSet.js';
+import { postMessage } from '../plugins/discord/discord.js';
+import { adminDirectory, hasBootstrapSupers } from '../plugins/discord/session.js';
 
 export const adminRouter = Router();
 
@@ -38,6 +39,12 @@ const writeSurveys = requirePermission(PERMISSIONS.SURVEYS_WRITE);
 const publishSurveys = requirePermission(PERMISSIONS.SURVEYS_PUBLISH);
 const deleteSurveys = requirePermission(PERMISSIONS.SURVEYS_DELETE);
 const readResults = requirePermission(PERMISSIONS.RESULTS_READ);
+
+const USERNAME_PATTERN = /^[a-zA-Z0-9._-]{3,32}$/;
+
+/** Whether the discord plugin is enabled with a server connected. */
+const discordActive = () =>
+  isPluginEnabled(current().plugins, PLUGINS.DISCORD) && current().discord.configured;
 
 /**
  * Reports whether a newer version is available.
@@ -137,7 +144,7 @@ async function maybeAnnounce(surveyId, status) {
       `${counts[0].completed} completed response(s) from ${counts[0].started} started. Thanks to everyone who took part.`;
   }
 
-  await discord.postMessage(channelId, content);
+  await postMessage(channelId, content);
   await query(`UPDATE surveys SET ${sentColumn} = true WHERE id = $1`, [surveyId]);
   return { posted: true };
 }
@@ -177,33 +184,6 @@ function slugify(title) {
 }
 
 // ---------------------------------------------------------------------------
-// Discord metadata, for the gate configuration UI
-// ---------------------------------------------------------------------------
-
-/** Lists the guild's roles and text channels so gates can be configured. */
-adminRouter.get('/discord', writeSurveys, async (req, res, next) => {
-  try {
-    const meta = await guildMetadata(req.query.refresh === '1');
-    if (req.query.refresh === '1') invalidateGuildCache();
-
-    res.json({
-      guild: { id: meta.guild.id, name: meta.guild.name },
-      roles: meta.roles
-        .filter((role) => role.id !== meta.guild.id)
-        .sort((a, b) => b.position - a.position)
-        .map((role) => ({ id: role.id, name: role.name, color: role.color })),
-      channels: meta.channels
-        // Text, announcement, and forum channels only; voice cannot gate a survey.
-        .filter((channel) => [0, 5, 15].includes(channel.type))
-        .sort((a, b) => a.position - b.position)
-        .map((channel) => ({ id: channel.id, name: channel.name, type: channel.type })),
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// ---------------------------------------------------------------------------
 // Plugins
 // ---------------------------------------------------------------------------
 
@@ -220,7 +200,7 @@ adminRouter.get('/discord', writeSurveys, async (req, res, next) => {
  */
 async function pluginUsage() {
   const { rows } = await query(
-    `SELECT s.id, s.title, s.plugin_config,
+    `SELECT s.id, s.title, s.plugin_config, s.gate_role_ids, s.gate_channel_ids,
             EXISTS (SELECT 1 FROM questions q WHERE q.survey_id = s.id AND q.config ? 'showIf')
               AS has_conditional
        FROM surveys s
@@ -228,6 +208,8 @@ async function pluginUsage() {
   );
 
   const usage = {
+    [PLUGINS.DISCORD]: [],
+    [PLUGINS.TWOFACTOR]: [],
     [PLUGINS.ANNOUNCEMENTS]: [],
     [PLUGINS.REMINDERS]: [],
     [PLUGINS.CONDITIONAL]: [],
@@ -239,6 +221,10 @@ async function pluginUsage() {
     const config = row.plugin_config ?? {};
     const entry = { id: row.id, title: row.title };
 
+    // A survey gated by role or channel needs Discord to evaluate the gate.
+    if (row.gate_role_ids.length > 0 || row.gate_channel_ids.length > 0) {
+      usage[PLUGINS.DISCORD].push(entry);
+    }
     if (config.announceChannelId) usage[PLUGINS.ANNOUNCEMENTS].push(entry);
     if (config.remindHoursBeforeClose !== undefined && config.remindHoursBeforeClose !== null) {
       usage[PLUGINS.REMINDERS].push(entry);
@@ -274,13 +260,44 @@ adminRouter.get('/plugins', requireAdmin, async (_req, res, next) => {
  * Updates plugin enablement.
  *
  * A plugin that an open survey depends on cannot be turned off, so a live
- * survey never loses behaviour out from under its participants.
+ * survey never loses behaviour out from under its participants. Dependencies
+ * are enforced the same way: the announcement plugins cannot run without
+ * discord, and discord cannot be turned off while local sign-in is.
  */
 adminRouter.put('/plugins', requireAdmin, async (req, res, next) => {
   try {
     const desired = sanitisePlugins(req.body?.plugins);
-    const currentPlugins = current().plugins ?? {};
+    const settings = current();
+    const currentPlugins = settings.plugins ?? {};
     const usage = await pluginUsage();
+
+    for (const plugin of PLUGIN_CATALOGUE) {
+      if (plugin.requires && desired[plugin.key] && !desired[plugin.requires]) {
+        const dependency = PLUGIN_CATALOGUE.find((entry) => entry.key === plugin.requires);
+        return res.status(409).json({
+          error: `${plugin.name} needs the ${dependency.name} plugin. Enable that first.`,
+          plugin: plugin.key,
+          requires: plugin.requires,
+        });
+      }
+    }
+
+    if (currentPlugins[PLUGINS.DISCORD] && !desired[PLUGINS.DISCORD]) {
+      if (settings.discord.source === 'environment') {
+        return res.status(409).json({
+          error:
+            'Discord is pinned by DISCORD_* environment variables, so the plugin cannot be disabled here.',
+          plugin: PLUGINS.DISCORD,
+        });
+      }
+      if (!settings.authMethods.local) {
+        return res.status(409).json({
+          error:
+            'Discord sign-in is the only enabled method. Enable local sign-in before disabling the plugin.',
+          plugin: PLUGINS.DISCORD,
+        });
+      }
+    }
 
     for (const plugin of PLUGIN_CATALOGUE) {
       const turningOff = currentPlugins[plugin.key] && !desired[plugin.key];
@@ -296,6 +313,54 @@ adminRouter.put('/plugins', requireAdmin, async (req, res, next) => {
     await savePlugins(desired);
     await audit(req.user.id, 'plugins.update', 'settings', 'app_settings', { plugins: desired });
     return res.json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Sign-in methods
+// ---------------------------------------------------------------------------
+
+/** Reports the sign-in method toggles and what they resolve to right now. */
+adminRouter.get('/auth-methods', requireAdmin, (_req, res) => {
+  const settings = current();
+  res.json({
+    methods: settings.authMethods,
+    effective: effectiveAuthMethods(),
+    discordReady: discordActive(),
+  });
+});
+
+/**
+ * Updates the sign-in method toggles.
+ *
+ * Guard rails, not preferences: the last usable method can never be switched
+ * off, and local cannot be dropped while Discord has nothing behind it, so no
+ * combination of toggles can lock every admin out.
+ */
+adminRouter.put('/auth-methods', requireAdmin, async (req, res, next) => {
+  try {
+    const desired = {
+      local: req.body?.methods?.local !== false,
+      discord: Boolean(req.body?.methods?.discord),
+    };
+
+    if (!desired.local && !discordActive()) {
+      return res.status(409).json({
+        error:
+          'Local sign-in cannot be disabled while the Discord plugin is not connected: nobody could sign in.',
+      });
+    }
+    if (!desired.local && !desired.discord) {
+      return res.status(409).json({ error: 'At least one sign-in method must stay enabled.' });
+    }
+
+    await saveAuthMethods(desired);
+    await audit(req.user.id, 'auth_methods.update', 'settings', 'app_settings', {
+      methods: desired,
+    });
+    return res.json({ ok: true, effective: effectiveAuthMethods() });
   } catch (error) {
     return next(error);
   }
@@ -320,7 +385,8 @@ adminRouter.get('/admins', async (req, res, next) => {
 
     const { rows } = await query(
       `SELECT id, discord_id, username, display_name, avatar, last_login_at,
-              tier, permissions
+              tier, permissions, totp_required, totp_confirmed_at,
+              password_hash IS NOT NULL AS local
          FROM users
         WHERE tier = ANY($1::admin_tier[])
         ORDER BY tier DESC, username`,
@@ -330,28 +396,24 @@ adminRouter.get('/admins', async (req, res, next) => {
     const settings = current();
     let roles = [];
     let channels = [];
+    let bootstrapIds = [];
 
     // Only super admins see how access is configured; to a plain admin the
-    // deployment's shape is not their concern.
-    if (req.user.isSuperAdmin) {
-      let meta = null;
-      try {
-        meta = await guildMetadata();
-      } catch {
-        meta = null;
-      }
-      roles = settings.adminRoleIds.map((roleId) => ({
-        id: roleId,
-        name: meta?.roles.find((role) => role.id === roleId)?.name ?? 'Unknown role',
-      }));
-      channels = (settings.adminChannelIds ?? []).map((channelId) => ({
-        id: channelId,
-        name: meta?.channelsById.get(channelId)?.name ?? 'Unknown channel',
-      }));
+    // deployment's shape is not their concern. The Discord-derived sources
+    // exist only while that plugin is connected.
+    if (req.user.isSuperAdmin && discordActive()) {
+      const directory = await adminDirectory();
+      roles = directory.roles;
+      channels = directory.channels;
+      bootstrapIds = directory.bootstrapIds;
     }
 
     res.json({
       canManage: req.user.isSuperAdmin,
+      plugins: {
+        discord: discordActive(),
+        twofactor: isPluginEnabled(settings.plugins, PLUGINS.TWOFACTOR),
+      },
       granted: rows.map((row) => ({
         id: row.id,
         discordId: row.discord_id,
@@ -359,12 +421,15 @@ adminRouter.get('/admins', async (req, res, next) => {
         displayName: row.display_name,
         lastLoginAt: row.last_login_at,
         tier: row.tier,
+        local: row.local,
+        totpRequired: row.totp_required,
+        totpEnrolled: Boolean(row.totp_confirmed_at),
         permissions: row.tier === TIERS.SUPER ? ALL_PERMISSIONS : row.permissions,
         isSelf: row.id === req.user.id,
       })),
       catalogue: ALL_PERMISSIONS.map((key) => ({ key, ...PERMISSION_LABELS[key] })),
       // Not revocable from here: these come from configuration, not a grant.
-      bootstrapIds: req.user.isSuperAdmin ? config.bootstrapAdminIds : [],
+      bootstrapIds,
       adminRoles: roles,
       adminChannels: channels,
     });
@@ -374,26 +439,19 @@ adminRouter.get('/admins', async (req, res, next) => {
 });
 
 /**
- * Grants admin access to a Discord user id.
+ * Creates a local admin account.
  *
- * The id is checked against the guild first, so a typo cannot silently create
- * an admin account for somebody who is not in the server.
+ * The one-time password comes back exactly once, for the granting admin to
+ * hand over; the holder changes it themselves. Granting by Discord id lives on
+ * the discord plugin's routes.
  */
 adminRouter.post('/admins', requireAdmin, async (req, res, next) => {
   try {
-    const discordId = String(req.body?.discordId ?? '').trim();
-    if (!/^\d{17,20}$/.test(discordId)) {
-      return res.status(400).json({ error: 'That does not look like a Discord user ID.' });
-    }
-
-    let member;
-    try {
-      member = await discord.guildMember(discordId);
-    } catch {
-      return res.status(502).json({ error: 'Could not reach Discord to check that account.' });
-    }
-    if (!member) {
-      return res.status(404).json({ error: 'That user is not a member of the server.' });
+    const username = String(req.body?.username ?? '').trim();
+    if (!USERNAME_PATTERN.test(username)) {
+      return res.status(400).json({
+        error: 'Usernames are 3-32 characters: letters, numbers, dots, dashes, underscores.',
+      });
     }
 
     // A super admin holds everything; a plain admin holds only what was
@@ -405,32 +463,53 @@ adminRouter.post('/admins', requireAdmin, async (req, res, next) => {
       return res.status(400).json({ error: 'Choose at least one permission.' });
     }
 
-    const profile = member.user ?? {};
+    const { rows: existing } = await query(
+      'SELECT 1 FROM users WHERE lower(username) = lower($1) AND password_hash IS NOT NULL',
+      [username],
+    );
+    if (existing.length > 0) {
+      return res.status(409).json({ error: 'That username is already taken.' });
+    }
+
+    const password = generatePassword();
     const { rows } = await query(
-      `INSERT INTO users (discord_id, username, display_name, avatar, tier, permissions)
-            VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (discord_id) DO UPDATE
-            SET tier = EXCLUDED.tier,
-                permissions = EXCLUDED.permissions,
-                username = COALESCE(EXCLUDED.username, users.username),
-                display_name = COALESCE(EXCLUDED.display_name, users.display_name)
-         RETURNING id, username`,
-      [
-        discordId,
-        profile.username ?? `user-${discordId.slice(-4)}`,
-        member.nick ?? profile.global_name ?? null,
-        profile.avatar ?? null,
-        superAdmin ? TIERS.SUPER : TIERS.ADMIN,
-        permissions,
-      ],
+      `INSERT INTO users (username, password_hash, tier, permissions)
+       VALUES ($1, $2, $3, $4) RETURNING id, username`,
+      [username, await hashPassword(password), superAdmin ? TIERS.SUPER : TIERS.ADMIN, permissions],
     );
 
     await audit(req.user.id, 'admin.grant', 'user', rows[0].id, {
-      discordId,
+      username,
       superAdmin,
       permissions,
+      method: 'local',
     });
-    return res.status(201).json({ ok: true, username: rows[0].username });
+    return res.status(201).json({ ok: true, username: rows[0].username, password });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * Resets a local admin's password to a fresh one-time value.
+ *
+ * The only recovery for a forgotten password; shown once, like at creation.
+ */
+adminRouter.post('/admins/:userId/password', requireAdmin, async (req, res, next) => {
+  try {
+    const password = generatePassword();
+    const { rows } = await query(
+      `UPDATE users SET password_hash = $2
+        WHERE id = $1 AND password_hash IS NOT NULL AND tier <> 'none'
+        RETURNING id, username`,
+      [req.params.userId, await hashPassword(password)],
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'That local admin was not found.' });
+    }
+
+    await audit(req.user.id, 'admin.password_reset', 'user', req.params.userId, {});
+    return res.json({ ok: true, username: rows[0].username, password });
   } catch (error) {
     return next(error);
   }
@@ -456,7 +535,7 @@ adminRouter.delete('/admins/:userId', requireAdmin, async (req, res, next) => {
     const { rows: counts } = await query(
       `SELECT count(*)::int AS n FROM users WHERE tier = 'super_admin'`,
     );
-    const hasOtherSource = config.bootstrapAdminIds.length > 0;
+    const hasOtherSource = discordActive() && hasBootstrapSupers();
 
     const { rows: target } = await query('SELECT tier FROM users WHERE id = $1', [
       req.params.userId,
@@ -515,7 +594,7 @@ adminRouter.patch('/admins/:userId', requireAdmin, async (req, res, next) => {
       if (
         target[0]?.tier === TIERS.SUPER &&
         counts[0].n <= 1 &&
-        config.bootstrapAdminIds.length === 0
+        !(discordActive() && hasBootstrapSupers())
       ) {
         return res.status(409).json({
           error: 'This is the only super administrator. Promote another one first.',

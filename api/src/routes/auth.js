@@ -1,99 +1,131 @@
 import { Router } from 'express';
+import rateLimit from 'express-rate-limit';
 import { config } from '../config.js';
 import { query } from '../db/pool.js';
-import * as discord from '../lib/discord.js';
-import { claimAdminToken, verifySetupToken } from '../lib/settings.js';
-import { SETUP_COOKIE } from './setup.js';
+import { hashPassword, verifyPassword } from '../lib/passwords.js';
+import { current, effectiveAuthMethods } from '../lib/settings.js';
+import { PLUGINS, isPluginEnabled } from '../lib/plugins.js';
 import { TIERS, sanitisePermissions } from '../lib/permissionSet.js';
-import { endSession, newStateToken, requireMember, startSession } from '../middleware/session.js';
+import { endSession, requireMember, startSession } from '../middleware/session.js';
+import { challengeRequired, issueChallenge } from '../plugins/twofactor/twofactor.js';
 
 export const authRouter = Router();
 
-const STATE_COOKIE = 'quorum_state';
+// Password guessing gets its own, tighter ceiling on top of the general
+// /api/auth limiter.
+const loginLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+});
+
+// A well-formed hash of nothing anyone can type, verified against when the
+// username is unknown so that path costs the same as a real check.
+const DUMMY_HASH =
+  'scrypt$16384$8$1$xtPm/4XR722L/e9XE9xkACL7Q9vhz+e7X8tjFjRSlu4=$Boco63O+i+ndm9g/XDNB5VCgSzgW+VTxdt46GArnYKBcX9zP7FIdaSd2Zuqy/+ZSeqEwh+PiEdHII39fTE4Sgw==';
 
 /**
- * Starts the Discord OAuth flow.
+ * Reports which sign-in methods are available, for the sign-in page.
  *
- * The CSRF state token is stored in a short-lived cookie and compared on the
- * callback, so a forged callback cannot complete a login.
+ * Public by design: the page has to know what to offer before anyone is
+ * signed in, and the toggles reveal nothing sensitive.
  */
-authRouter.get('/login', (req, res) => {
-  const state = newStateToken();
-
-  res.cookie(STATE_COOKIE, state, {
-    httpOnly: true,
-    secure: config.publicUrl.startsWith('https://'),
-    sameSite: 'lax',
-    maxAge: 10 * 60 * 1000,
-    path: '/',
-  });
-
-  res.redirect(discord.authorizeUrl(state));
+authRouter.get('/methods', (_req, res) => {
+  res.json({ methods: effectiveAuthMethods() });
 });
 
 /**
- * Completes the OAuth flow.
+ * Signs in with a local username and password.
  *
- * Guild membership is checked with the bot token rather than the member's OAuth
- * token, so a token minted by another application cannot be replayed here.
+ * The response never says which of the two was wrong. Failures are audited so
+ * a guessing run leaves a trail. Accounts under 2FA get a challenge cookie
+ * instead of a session; POST /2fa completes the sign-in.
  */
-authRouter.get('/callback', async (req, res, next) => {
+authRouter.post('/login', loginLimiter, async (req, res, next) => {
   try {
-    const { code, state } = req.query;
-    const expected = req.cookies?.[STATE_COOKIE];
-    res.clearCookie(STATE_COOKIE, { path: '/' });
-
-    if (!code || !state || state !== expected) {
-      return res.redirect('/?error=invalid_state');
+    if (!effectiveAuthMethods().local) {
+      return res.status(403).json({ error: 'Password sign-in is not enabled.' });
     }
 
-    const token = await discord.exchangeCode(String(code));
-    const profile = await discord.currentUser(token.access_token);
-
-    const member = await discord.guildMember(profile.id);
-    if (!member) return res.redirect('/?error=not_in_guild');
-
-    // The operator who completed setup claims admin with their first sign-in.
-    // The token is consumed atomically, so the claim can only ever happen once.
-    let claimedAdmin = false;
-    const setupToken = await verifySetupToken(req.cookies?.[SETUP_COOKIE]);
-    if (setupToken?.awaiting_admin_claim) {
-      claimedAdmin = await claimAdminToken(setupToken.id);
-      res.clearCookie(SETUP_COOKIE, { path: '/' });
+    const username = String(req.body?.username ?? '').trim();
+    const password = String(req.body?.password ?? '');
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Enter a username and password.' });
     }
 
     const { rows } = await query(
-      `INSERT INTO users (discord_id, username, display_name, avatar, tier, last_login_at)
-            VALUES ($1, $2, $3, $4, $5, now())
-       ON CONFLICT (discord_id) DO UPDATE
-            SET username = EXCLUDED.username,
-                display_name = EXCLUDED.display_name,
-                avatar = EXCLUDED.avatar,
-                -- A stored tier is never lowered by a later login. Role and
-                -- channel derived access is recomputed per request instead.
-                tier = GREATEST(users.tier, EXCLUDED.tier),
-                last_login_at = now()
-         RETURNING id, discord_id`,
-      [
-        profile.id,
-        profile.username,
-        member.nick ?? profile.global_name ?? null,
-        profile.avatar,
-        // Completing setup mints the first super admin; everyone else starts
-        // with no stored tier and is resolved from roles and channels.
-        claimedAdmin ? TIERS.SUPER : TIERS.NONE,
-      ],
+      'SELECT * FROM users WHERE lower(username) = lower($1) AND password_hash IS NOT NULL',
+      [username],
     );
+    const user = rows[0] ?? null;
 
-    await startSession(res, { id: rows[0].id, discordId: rows[0].discord_id }, member.roles);
-    return res.redirect('/');
+    // The hash is verified even for an unknown username, so the response time
+    // does not reveal which usernames exist.
+    const ok = await verifyPassword(password, user?.password_hash ?? DUMMY_HASH);
+    if (!user || !ok) {
+      await query(
+        `INSERT INTO audit_log (actor_id, action, target_type, target_id, meta)
+         VALUES (NULL, 'auth.login_failed', 'user', NULL, $1)`,
+        [{ username }],
+      );
+      return res.status(401).json({ error: 'Wrong username or password.' });
+    }
+
+    if (challengeRequired(user)) {
+      issueChallenge(res, user.id);
+      return res.json({ ok: true, twofactor: true });
+    }
+
+    await query('UPDATE users SET last_login_at = now() WHERE id = $1', [user.id]);
+    await startSession(res, { id: user.id }, []);
+    return res.json({ ok: true, twofactor: false });
   } catch (error) {
     return next(error);
   }
 });
 
 /**
- * Signs in without Discord, for local preview.
+ * Changes the caller's own password.
+ *
+ * Takes the current password, so a walked-away-from session is not enough to
+ * take the account over.
+ */
+authRouter.post('/password', requireMember, async (req, res, next) => {
+  try {
+    const currentPassword = String(req.body?.currentPassword ?? '');
+    const newPassword = String(req.body?.newPassword ?? '');
+
+    const { rows } = await query('SELECT password_hash FROM users WHERE id = $1', [req.user.id]);
+    if (!rows[0]?.password_hash) {
+      return res.status(400).json({ error: 'This account has no password to change.' });
+    }
+
+    if (!(await verifyPassword(currentPassword, rows[0].password_hash))) {
+      return res.status(403).json({ error: 'The current password is wrong.' });
+    }
+    if (newPassword.length < 8 || newPassword.length > 200) {
+      return res.status(400).json({ error: 'Passwords need at least 8 characters.' });
+    }
+
+    await query('UPDATE users SET password_hash = $2 WHERE id = $1', [
+      req.user.id,
+      await hashPassword(newPassword),
+    ]);
+
+    await query(
+      `INSERT INTO audit_log (actor_id, action, target_type, target_id)
+       VALUES ($1, 'auth.password_change', 'user', $2)`,
+      [req.user.id, req.user.id],
+    );
+    return res.json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * Signs in without an account, for local preview.
  *
  * Registered only when the bypass is active, so on a real deployment this path
  * does not exist at all rather than existing and refusing.
@@ -115,11 +147,11 @@ if (config.devAuthBypass) {
                   tier = EXCLUDED.tier,
                   permissions = EXCLUDED.permissions,
                   last_login_at = now()
-           RETURNING id, discord_id`,
+           RETURNING id`,
         [discordId, username, username, tier, sanitisePermissions(req.body?.permissions)],
       );
 
-      await startSession(res, { id: rows[0].id, discordId: rows[0].discord_id }, []);
+      await startSession(res, { id: rows[0].id }, []);
       return res.json({ ok: true, username });
     } catch (error) {
       return next(error);
@@ -138,21 +170,29 @@ authRouter.post('/logout', async (req, res, next) => {
 });
 
 /**
- * Returns the signed-in member, or null when signed out.
+ * Returns the signed-in account, or null when signed out.
  *
  * Role ids are deliberately not exposed to the client; gate decisions are made
  * server-side and surfaced as a boolean per survey.
  */
 authRouter.get('/me', (req, res) => {
-  if (!req.user) return res.json({ user: null, devAuthBypass: config.devAuthBypass });
+  const plugins = {
+    discord: isPluginEnabled(current().plugins, PLUGINS.DISCORD),
+    twofactor: isPluginEnabled(current().plugins, PLUGINS.TWOFACTOR),
+  };
+
+  if (!req.user) return res.json({ user: null, plugins, devAuthBypass: config.devAuthBypass });
 
   return res.json({
+    plugins,
+    devAuthBypass: config.devAuthBypass,
     user: {
       id: req.user.id,
       username: req.user.username,
       displayName: req.user.displayName,
       avatar: req.user.avatar,
       discordId: req.user.discordId,
+      hasPassword: req.user.hasPassword,
       isAdmin: req.user.isAdmin,
       isSuperAdmin: req.user.isSuperAdmin,
       tier: req.user.tier,
@@ -169,7 +209,7 @@ const THEME_MODES = new Set(['light', 'dark']);
 /**
  * Saves the caller's skin and mode preference.
  *
- * Requires a signed-in member; the values are validated against the known
+ * Requires a signed-in account; the values are validated against the known
  * skins and modes so nothing unexpected is ever persisted or echoed back.
  */
 authRouter.put('/theme', requireMember, async (req, res, next) => {
@@ -188,4 +228,15 @@ authRouter.put('/theme', requireMember, async (req, res, next) => {
   } catch (error) {
     return next(error);
   }
+});
+
+/**
+ * Legacy OAuth callback path.
+ *
+ * Older Discord applications registered `/api/auth/callback` as their redirect
+ * URL, so it forwards to the plugin's callback rather than breaking them.
+ */
+authRouter.get('/callback', (req, res) => {
+  const search = req.originalUrl.split('?')[1] ?? '';
+  res.redirect(`/api/auth/discord/callback${search ? `?${search}` : ''}`);
 });

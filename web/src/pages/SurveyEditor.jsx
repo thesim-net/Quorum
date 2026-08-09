@@ -500,12 +500,16 @@ export function SurveyEditor() {
         setQuestions(data.questions);
         setResponses(data.responses);
         setPlugins(data.plugins ?? {});
+
+        // Roles and channels come from the discord plugin, so they are only
+        // asked for when it is enabled; the gate card explains itself otherwise.
+        if (data.plugins?.discord) {
+          api('/plugin/discord/guild')
+            .then(setDiscord)
+            .catch(() => setDiscord({ roles: [], channels: [] }));
+        }
       })
       .catch((e) => setError(e.message));
-
-    api('/admin/discord')
-      .then(setDiscord)
-      .catch(() => setDiscord({ roles: [], channels: [] }));
 
     api('/admin/me').then(setMe).catch(() => setMe(null));
   }, [id]);
@@ -800,10 +804,12 @@ export function SurveyEditor() {
         </div>
       ) : null}
 
+      {plugins.discord ? (
       <div className="card">
         <h2>Who can take it</h2>
         <p className="muted" style={{ fontSize: '0.85rem' }}>
-          Leave both lists empty and anyone in the server can take the survey.
+          Leave both lists empty and anyone with the link can take the survey. Restricting by role
+          or channel means participants must sign in with Discord.
         </p>
 
         <label>
@@ -857,6 +863,15 @@ export function SurveyEditor() {
           </div>
         ) : null}
       </div>
+      ) : (
+      <div className="card">
+        <h2>Who can take it</h2>
+        <p className="muted" style={{ marginBottom: 0 }}>
+          Anyone with the link. Restricting a survey to Discord roles or channels needs the
+          Discord Integration plugin.
+        </p>
+      </div>
+      )}
 
       <h2>Questions</h2>
       {questions.map((question, index) => (

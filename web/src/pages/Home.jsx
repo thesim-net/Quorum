@@ -29,7 +29,11 @@ function CollectionBadges({ disclosures }) {
 }
 
 /**
- * Lists the open surveys the signed-in member can take.
+ * Lists the open surveys.
+ *
+ * No sign-in is needed: anyone with the link can browse and take open surveys.
+ * A survey restricted to Discord roles or channels is still listed, with a
+ * sign-in prompt in place of its start button.
  *
  * @returns {JSX.Element} The page.
  */
@@ -53,10 +57,10 @@ export function Home() {
       <div className="disclosure">
         <h3>What these surveys may collect</h3>
         <p className="muted" style={{ margin: '0 0 0.5rem' }}>
-          Depending on the survey, we may record your Discord username, how long you spend
-          answering, or the country you answer from. Every survey tells you exactly what it
-          collects before you start, and your answers are never shared outside our community or
-          linked across surveys.
+          Answers are anonymous unless a survey says otherwise. Depending on the survey, it may
+          record your username (if you are signed in), how long you spend answering, or the country
+          you answer from. Every survey tells you exactly what it collects before you start, and
+          your answers are never shared outside our community or linked across surveys.
         </p>
         <Link to="/privacy">Read the full data privacy page</Link>
       </div>
@@ -70,6 +74,7 @@ export function Home() {
               <h2 style={{ margin: 0 }}>{survey.title}</h2>
               {survey.myStatus === 'completed' ? <span className="badge">Completed</span> : null}
               {survey.myStatus === 'in_progress' ? <span className="badge">In progress</span> : null}
+              {survey.requiresDiscord ? <span className="badge">Discord members only</span> : null}
             </div>
 
             {survey.description ? <p>{survey.description}</p> : null}
@@ -79,15 +84,21 @@ export function Home() {
             </div>
 
             <p style={{ marginTop: '0.9rem' }}>
-              <Link className="button primary" to={`/s/${survey.slug}`}>
-                {survey.myStatus === 'completed'
-                  ? survey.allowsEdits
-                    ? 'Change my answers'
-                    : 'View'
-                  : survey.myStatus === 'in_progress'
-                    ? 'Resume'
-                    : 'Take survey'}
-              </Link>
+              {survey.requiresDiscord ? (
+                <a className="button primary" href="/api/auth/discord/login">
+                  Sign in with Discord to take this survey
+                </a>
+              ) : (
+                <Link className="button primary" to={`/s/${survey.slug}`}>
+                  {survey.myStatus === 'completed'
+                    ? survey.allowsEdits
+                      ? 'Change my answers'
+                      : 'View'
+                    : survey.myStatus === 'in_progress'
+                      ? 'Resume'
+                      : 'Take survey'}
+                </Link>
+              )}
             </p>
           </div>
         ))

@@ -21,30 +21,49 @@ export function Privacy() {
       </p>
       <h1>Data privacy</h1>
       <p className="muted">
-        This is a self-hosted survey tool for our Discord community. It runs on our own
-        infrastructure and sends nothing to third parties. Below is everything it is capable of
-        collecting, why, and how long it keeps it. Each individual survey may collect less, and
-        tells you exactly what it collects before you answer a single question.
+        This is a self-hosted survey tool. It runs on our own infrastructure and sends nothing to
+        third parties. Below is everything it is capable of collecting, why, and how long it keeps
+        it. Each individual survey may collect less, and tells you exactly what it collects before
+        you answer a single question.
       </p>
 
-      <h2>Signing in</h2>
+      <h2>Taking a survey needs no account</h2>
       <p>
-        You sign in with Discord so we can confirm you are a member of our server, since these
-        surveys are only for our community. We ask Discord only for the <code>identify</code>{' '}
-        permission.
+        You do not sign in to answer a survey. Your browser is given a random identifier in a
+        signed cookie; it contains nothing about you and exists so you can only submit once and can
+        come back to edit your answers where a survey allows that.
       </p>
       <ul>
         <li>
-          <strong>What:</strong> your Discord user ID, username, display name, and avatar.
+          <strong>What:</strong> a random value with no connection to your name, account, or device.
+        </li>
+        <li>
+          <strong>Why:</strong> one response per person, and the ability to resume or edit your own
+          response. Clearing the cookie simply makes you a new, unrelated respondent.
+        </li>
+      </ul>
+
+      <h2>Signing in</h2>
+      <p>
+        Administrators sign in with a username and password. If the community has switched on the
+        Discord plugin, members can also sign in with Discord; that is only ever needed for surveys
+        restricted to particular server roles or channels. We ask Discord only for the{' '}
+        <code>identify</code> permission.
+      </p>
+      <ul>
+        <li>
+          <strong>What (Discord sign-in only):</strong> your Discord user ID, username, display
+          name, and avatar.
         </li>
         <li>
           <strong>Why:</strong> to verify server membership, to apply any role or channel
-          restrictions on a survey, and to show your name in the corner while you are signed in.
+          restrictions on a survey, and to show your name while you are signed in.
         </li>
         <li>
           <strong>How it is stored:</strong> in our database, updated each time you sign in. Your
           session is a signed, http-only cookie that expires on its own; it holds no personal data
-          itself.
+          itself. Two-factor authentication secrets, where an admin sets that up, are stored
+          encrypted.
         </li>
       </ul>
 
@@ -52,9 +71,9 @@ export function Privacy() {
 
       <h3>A pseudonymous fingerprint (always)</h3>
       <p>
-        For every response we store a one-way fingerprint derived from your Discord ID and a key
-        unique to that survey. We <strong>never</strong> store your raw ID against a response
-        unless the survey explicitly records usernames (below).
+        For every response we store a one-way fingerprint derived from your anonymous browser
+        identifier and a key unique to that survey. We <strong>never</strong> store who you are
+        against a response unless the survey explicitly records usernames (below).
       </p>
       <ul>
         <li>
@@ -68,10 +87,11 @@ export function Privacy() {
         </li>
       </ul>
 
-      <h3>Your username (only if the survey says so)</h3>
+      <h3>Your username (only if the survey says so, and only when signed in)</h3>
       <ul>
         <li>
-          <strong>What:</strong> which member submitted each response.
+          <strong>What:</strong> which signed-in account submitted each response. If you are not
+          signed in, there is no username to record.
         </li>
         <li>
           <strong>Why:</strong> some surveys need attributable answers; most do not. This is off by
@@ -137,26 +157,23 @@ export function Privacy() {
         irreversible.
       </p>
 
-      <h2>A note on Discord</h2>
-      <p>
-        We may use Discord to discuss survey results privately among administrators. Discord is not
-        a third-party service in this context, because this whole tool already relies on Discord to
-        sign you in. Anything Discord itself collects, such as your IP address and your Discord name
-        and user ID, it already collects the moment you use Discord at all, independently of these
-        surveys.
-      </p>
-      <p>
-        We may discuss the results of those surveys privately in an effort to provide better service
-        to the community. This is likely well understood, but we did not want to miss mentioning it
-        to our community survey participants.
-      </p>
-
       <h2>Optional features</h2>
       <p>
-        The community may switch on optional features. Where one affects your data, here is what it
+        The community may switch on optional plugins. Where one affects your data, here is what it
         does:
       </p>
       <ul>
+        <li>
+          <strong>Discord:</strong> everything under &ldquo;Signing in&rdquo; above only applies
+          while this plugin is enabled. With it off, the tool holds no Discord data at all.
+          Anything Discord itself collects, such as your IP address and your Discord name and user
+          ID, it already collects the moment you use Discord at all, independently of these
+          surveys.
+        </li>
+        <li>
+          <strong>Two-factor authentication:</strong> applies to administrator accounts only. The
+          shared secret behind the codes is stored encrypted and can be removed again.
+        </li>
         <li>
           <strong>Announcements and reminders:</strong> a survey&rsquo;s link, and when it closes a
           count of how many people took part, may be posted to a Discord channel. This is only ever
@@ -178,15 +195,15 @@ export function Privacy() {
       <ul>
         <li>Store your IP address on this survey tool.</li>
         <li>
-          Send your data to a third-party service. Discord, which this tool is built on, is not a
-          third party here.
+          Send your data to a third-party service. Discord, when that plugin is enabled, is the
+          service this community already lives on rather than a third party.
         </li>
         <li>Track you across other sites, or load anything from other sites while you use this one.</li>
         <li>Correlate your answers between different surveys.</li>
       </ul>
 
       <p className="muted">
-        Questions about any of this are best raised with the administrators of our Discord server.
+        Questions about any of this are best raised with the administrators of this deployment.
       </p>
     </div>
   );

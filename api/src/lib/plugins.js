@@ -7,6 +7,8 @@
  */
 
 export const PLUGINS = {
+  DISCORD: 'discord',
+  TWOFACTOR: 'twofactor',
   ANNOUNCEMENTS: 'announcements',
   REMINDERS: 'reminders',
   CONDITIONAL: 'conditional',
@@ -17,16 +19,30 @@ export const PLUGINS = {
 /** Display metadata, shared with the frontend through the API. */
 export const PLUGIN_CATALOGUE = [
   {
+    key: PLUGINS.DISCORD,
+    name: 'Discord Integration',
+    detail:
+      'Sign in with Discord, restrict surveys by server role or channel, and let the bot post for the announcement plugins. Connect your server from the plugin settings page.',
+  },
+  {
+    key: PLUGINS.TWOFACTOR,
+    name: 'Two-Factor Authentication',
+    detail:
+      'Time-based one-time codes for admin sign-in, set up with any authenticator app. Once enabled, 2FA can be required per account.',
+  },
+  {
     key: PLUGINS.ANNOUNCEMENTS,
     name: 'Discord Announcements',
     detail:
       'Post to a chosen channel when a survey opens or closes, with a short summary of the results on close. The bot needs the Send Messages permission in that channel.',
+    requires: PLUGINS.DISCORD,
   },
   {
     key: PLUGINS.REMINDERS,
     name: 'Reminders & Nudges',
     detail:
       'Post a reminder to the announcement channel before a scheduled survey closes, so members have a chance to take part.',
+    requires: PLUGINS.DISCORD,
   },
   {
     key: PLUGINS.CONDITIONAL,

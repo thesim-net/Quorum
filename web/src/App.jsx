@@ -6,6 +6,7 @@ import { Home } from './pages/Home.jsx';
 import { TakeSurvey } from './pages/TakeSurvey.jsx';
 import { Privacy } from './pages/Privacy.jsx';
 import { Verify } from './pages/Verify.jsx';
+import { SignIn } from './pages/SignIn.jsx';
 
 // The admin panel pulls in the charting library, which participants never need.
 // Loading it lazily keeps the bundle a survey-taker downloads small.
@@ -23,6 +24,9 @@ const AdminSettings = lazy(() =>
 );
 const Setup = lazy(() => import('./pages/Setup.jsx').then((m) => ({ default: m.Setup })));
 const Plugins = lazy(() => import('./pages/Plugins.jsx').then((m) => ({ default: m.Plugins })));
+const DiscordSettings = lazy(() =>
+  import('./pages/DiscordSettings.jsx').then((m) => ({ default: m.DiscordSettings })),
+);
 
 /**
  * The "QUORUM" wordmark as standard-figlet ASCII art.
@@ -39,75 +43,6 @@ const QUORUM_ASCII = [
   ' \\__\\_\\ \\___/  \\___/ |_| \\_\\ \\___/ |_|  |_|',
 ].join('\n');
 
-/**
- * The signed-out landing screen.
- *
- * @returns {JSX.Element} A prompt to sign in with Discord.
- */
-function SignIn({ devAuthBypass }) {
-  const params = new URLSearchParams(window.location.search);
-  const error = params.get('error');
-
-  const messages = {
-    not_in_guild: 'That Discord account is not a member of our server.',
-    invalid_state: 'Sign-in expired. Please try again.',
-  };
-
-  /**
-   * Signs in without Discord. Only reachable in local preview.
-   *
-   * @param {boolean} admin Whether to sign in as an admin.
-   */
-  const devLogin = async (admin) => {
-    await api('/auth/dev-login', {
-      method: 'POST',
-      body: { admin, username: admin ? 'previewadmin' : 'previewmember' },
-    });
-    window.location.href = '/';
-  };
-
-  return (
-    <div className="shell">
-      <div className="card">
-        <h1>Sign in</h1>
-        <p className="muted">
-          These surveys are for our Discord community, so sign-in confirms you are a member of
-          the server. Nothing is posted on your behalf.
-        </p>
-        {error ? <div className="error">{messages[error] ?? 'Sign-in failed.'}</div> : null}
-        <a className="button primary" href="/api/auth/login">
-          Continue with Discord
-        </a>
-
-        {devAuthBypass ? (
-          <div className="disclosure" style={{ marginTop: '1.5rem' }}>
-            <h3>Local preview mode</h3>
-            <p className="muted" style={{ margin: '0 0 0.75rem' }}>
-              Discord sign-in is bypassed because <code>DEV_AUTH_BYPASS</code> is set. This is
-              never available on a real deployment.
-            </p>
-            <div className="row">
-              <button type="button" onClick={() => devLogin(true)}>
-                Sign in as admin
-              </button>
-              <button type="button" onClick={() => devLogin(false)}>
-                Sign in as member
-              </button>
-            </div>
-          </div>
-        ) : null}
-      </div>
-    </div>
-  );
-}
-
-/**
- * Shown when Discord has not been connected yet.
- *
- * @param {{error: string|null}} props `error` is set when stored credentials
- *   exist but can no longer be decrypted.
- * @returns {JSX.Element} The prompt.
- */
 /**
  * The glitching "QUORUM" ASCII wordmark.
  *
@@ -276,20 +211,19 @@ function Footer({ build, attestState }) {
   );
 }
 
-function NeedsSetup({ error }) {
+/**
+ * Shown before the first administrator account exists.
+ *
+ * @returns {JSX.Element} The prompt.
+ */
+function NeedsSetup() {
   return (
     <div className="shell">
       <div className="card">
         <h1>Setup needed</h1>
-        {error === 'unreadable' ? (
-          <div className="error">
-            Stored Discord credentials could not be decrypted. This happens when SESSION_SECRET
-            changes. Run setup again to reconnect.
-          </div>
-        ) : null}
         <p className="muted">
-          This site is not connected to a Discord server yet. Open the one-time setup link printed
-          in the container logs:
+          This deployment has no administrator yet. Open the one-time setup link printed in the
+          container logs to create the first admin account:
         </p>
         <pre className="codeblock">docker compose logs api | grep setup</pre>
       </div>
@@ -339,7 +273,7 @@ export function App() {
   }, [setSkin, applyMode]);
 
   /**
-   * Persists the signed-in member's skin and mode to their account.
+   * Persists the signed-in account's skin and mode.
    *
    * @param {string} skin
    * @param {string} mode
@@ -375,15 +309,15 @@ export function App() {
     return <div className="shell muted">Loading...</div>;
   }
 
-  // Before Discord is connected nobody can sign in, so the wizard has to be
-  // reachable without a session.
+  // Until a super admin exists nobody can sign in, so the setup form has to be
+  // reachable without a session and everything else waits.
   if (!setupState.configured) {
     return (
       <>
         <Suspense fallback={<div className="shell muted">Loading...</div>}>
           <Routes>
             <Route path="/setup" element={<Setup />} />
-            <Route path="*" element={<NeedsSetup error={setupState.error} />} />
+            <Route path="*" element={<NeedsSetup />} />
           </Routes>
         </Suspense>
         <Footer build={build} attestState={attestState} />
@@ -391,16 +325,7 @@ export function App() {
     );
   }
 
-  if (user === null) {
-    return (
-      <>
-        <SignIn devAuthBypass={devAuthBypass} />
-        <Footer build={build} attestState={attestState} />
-      </>
-    );
-  }
-
-  /** Ends the session and returns to the sign-in screen. */
+  /** Ends the session and returns to the surveys list. */
   const logout = async () => {
     await api('/auth/logout', { method: 'POST' });
     window.location.href = '/';
@@ -415,28 +340,40 @@ export function App() {
           <BrandGlitch still={onSurvey} />
         </Link>
         <nav>
-          {user.isAdmin ? <Link to="/surveys">Manage surveys</Link> : null}
-          {user.isAdmin ? <Link to="/admin">Admin</Link> : null}
+          {user?.isAdmin ? <Link to="/surveys">Manage surveys</Link> : null}
+          {user?.isAdmin ? <Link to="/admin">Admin</Link> : null}
           <ThemeControls onChange={saveTheme} />
-          <button type="button" onClick={logout}>
-            Sign out
-          </button>
+          {user ? (
+            <button type="button" onClick={logout}>
+              Sign out
+            </button>
+          ) : (
+            <Link to="/login">Sign in</Link>
+          )}
         </nav>
       </header>
 
       <Suspense fallback={<div className="shell muted">Loading...</div>}>
         <Routes>
-          <Route path="/" element={<Home />} />
+          <Route path="/" element={<Home user={user} />} />
           <Route path="/s/:slug" element={<TakeSurvey />} />
-          {user.isAdmin ? (
+          <Route
+            path="/login"
+            element={user ? <Navigate to="/" replace /> : <SignIn devAuthBypass={devAuthBypass} />}
+          />
+          {user?.isAdmin ? (
             <>
               <Route path="/admin" element={<AdminSettings />} />
               <Route path="/surveys" element={<AdminSurveys />} />
               <Route path="/admin/surveys/:id" element={<SurveyEditor />} />
               <Route path="/admin/surveys/:id/results" element={<SurveyResults />} />
               <Route path="/plugins" element={<Plugins />} />
-              {/* Setup is super admins only, enforced server-side too. */}
-              {user.isSuperAdmin ? <Route path="/setup" element={<Setup />} /> : null}
+              {/* The Discord wizard is super admins only, enforced server-side
+                  too. Reachable while the plugin is off, so a server can be
+                  connected before switching it on. */}
+              {user.isSuperAdmin ? (
+                <Route path="/plugins/discord" element={<DiscordSettings />} />
+              ) : null}
             </>
           ) : null}
           <Route path="*" element={<Navigate to="/" replace />} />

@@ -1,29 +1,29 @@
 # Quorum
 
-A self-hosted, privacy-focused survey tool for a Discord community. Members sign in with Discord, and surveys are gated on server membership, roles, or channel access. It runs entirely on your own infrastructure and sends nothing to third parties.
+A self-hosted, privacy-focused survey tool. Respondents answer anonymously with no account at all; admins sign in with a username and password, optionally hardened with TOTP two-factor authentication. The Discord plugin adds Discord sign-in and lets surveys be gated on server membership, roles, or channel access. It runs entirely on your own infrastructure and sends nothing to third parties.
 
 Created by [Thomas Loupe](https://thomasloupe.com).
 
 ## Features
 
-- **Discord sign-in** that verifies server membership; surveys can be limited to specific roles or to members who can see a given channel.
+- **Anonymous responses** with no respondent accounts; local username/password sign-in for admins, with optional TOTP two-factor authentication.
+- **Discord sign-in as a plugin** that verifies server membership; surveys can be limited to specific roles or to members who can see a given channel.
 - **Eight question types:** short and long text (with character limits), integer (min/max/step), single choice, multiple choice (with selection limits), ranking, true/false (with custom labels), scale, and file upload.
 - **Privacy by design:** responses are pseudonymous by default, IP addresses are never stored, and every collection toggle is disclosed to the participant before they answer.
 - **Results dashboards** with per-question charts (donuts and bars), a table view for every chart, colour-vision-safe palettes, and CSV/JSON export.
-- **Admin panel** to create, schedule, open, close, and delete surveys, manage admins with granular permissions, and configure everything through a guided Discord setup wizard.
-- **Optional plugins:** Discord announcements, closing reminders, conditional question logic, response quotas, and a raffle picker.
+- **Admin panel** to create, schedule, open, close, and delete surveys, manage admins with granular permissions, and connect Discord through a guided wizard.
+- **Optional plugins:** Discord integration, two-factor authentication, Discord announcements, closing reminders, conditional question logic, response quotas, and a raffle picker.
 - **Four skins** (Default, GitHub, Obsidian, High Contrast) in light and dark, remembered per account.
 - **A public data-privacy page** that spells out exactly what a deployment can collect, why, and when it is anonymised.
 
 ## Quick start
 
-1. `cp .env.example .env` and fill it in. Discord credentials do **not** go here.
+1. `cp .env.example .env` and fill it in.
 2. `docker compose up -d --build`
 3. Find the one-time setup link in the logs: `docker compose logs api | grep setup`
-4. Open it and connect your Discord server. The wizard verifies the credentials against Discord before saving them.
-5. Sign in with Discord when prompted. That account becomes the first super administrator.
+4. Open it and create the first super administrator account (username + password). You are signed in immediately; surveys can be created and taken right away, no Discord required.
 
-You will need a [Discord application](https://discord.com/developers/applications) with a redirect URL of `<PUBLIC_URL>/api/auth/callback`, and a bot invited to your server with the `View Channels` permission. The bot never posts unless you enable the announcements plugin (which then needs `Send Messages` in the chosen channel).
+To add Discord sign-in and role/channel gating, enable the **Discord Integration** plugin under Admin, Plugins, and connect your server from its settings page. You will need a [Discord application](https://discord.com/developers/applications) with a redirect URL of `<PUBLIC_URL>/api/auth/callback`, and a bot invited to your server with the `View Channels` permission. The bot never posts unless you enable the announcements plugin (which then needs `Send Messages` in the chosen channel).
 
 Requested OAuth scopes are kept to `identify` alone. The bot token is what makes channel gating, gate configuration, adding admins by user ID, and prompt access revocation possible, because Discord exposes no OAuth scope for a guild's channel overwrites or role permissions.
 
@@ -50,26 +50,28 @@ A pass proves the image was built by this repo's release workflow from that comm
 
 ## Privacy model
 
-- **Respondent identity is pseudonymous by default.** Each response stores `HMAC(per-survey key, pepper + discord_id)`, never the raw id, unless the survey has "record username" enabled. The key is per survey, so responses cannot be correlated across surveys.
+- **Respondent identity is pseudonymous by default.** Each response stores `HMAC(per-survey key, pepper + respondent id)`, where the respondent id is a random value in a signed browser cookie; a signed-in account is only linked when the survey has "record username" enabled. The key is per survey, so responses cannot be correlated across surveys.
 - **Rotating a survey's respondent key permanently detaches its responses from their authors.** This is the deletion primitive.
 - **IP addresses are never stored.** Country, when collected, is resolved in-process at submit time and only the two-letter code is kept.
 - **Every collection toggle is disclosed to the participant** on the survey intro screen before they answer anything.
 - **No third-party requests.** A strict Content-Security-Policy allows only the site's own origin and Discord's CDN for avatars.
-- **Stored Discord credentials are encrypted at rest** with a key derived from `SESSION_SECRET`.
+- **Stored Discord credentials and 2FA secrets are encrypted at rest** with a key derived from `SESSION_SECRET`.
 
 ## Admins
 
 Two tiers:
 
-- **Super administrator:** unrestricted. Manages other admins, promotes further super admins, and re-runs setup. The first one is whoever completes setup and signs in.
+- **Super administrator:** unrestricted. Manages other admins, promotes further super admins, and configures sign-in and plugins. The first one is created by the one-time setup link.
 - **Administrator:** only the permissions granted: create/edit surveys, open/close surveys, delete surveys, and view results/export.
 
-A plain administrator never sees that super administrators exist. Admins can also be granted by a Discord role or channel chosen during setup; those grant the administrator tier, never super administrator. You cannot remove your own access, and the last super administrator cannot be removed.
+Admins are local accounts (created with a one-time password shown once), or Discord members granted by user id when that plugin is connected. A plain administrator never sees that super administrators exist. Admins can also be granted by a Discord role or channel chosen in the Discord plugin settings; those grant the administrator tier, never super administrator. You cannot remove your own access, and the last super administrator cannot be removed.
 
 ## Plugins
 
 Each plugin has a global on/off switch and cannot be disabled while an open survey depends on it.
 
+- **Discord Integration:** Discord sign-in, role/channel survey gates, granting admins by Discord user id, and the bot transport the announcement plugins post through.
+- **Two-Factor Authentication:** TOTP codes for admin sign-in (QR code or manual secret entry); super admins can require it per account.
 - **Discord Announcements:** post to a channel when a survey opens or closes, with an aggregate result summary on close.
 - **Reminders & Nudges:** post a "closing soon" reminder before a scheduled close.
 - **Conditional Logic:** show or skip questions based on an earlier answer.
@@ -82,12 +84,13 @@ Node 22 + Express API, React SPA (Vite + Recharts), PostgreSQL 17, all behind ng
 
 ```
 api/            Express API
-  src/lib/      Discord client, permission maths, answer validation, gating, timing, crypto, plugins
+  src/lib/      Answer validation, timing, crypto, passwords, plugin catalogue, settings
   src/db/       Pool, migrations, migration runner
   src/routes/   Auth, setup, participant, admin
+  src/plugins/  discord (client, gates, permission maths, OAuth, wizard), twofactor (TOTP)
 web/            React SPA
   src/charts/   Validated palette and the result charts
-  src/pages/    Survey taking, admin panel, setup wizard, plugins, privacy
+  src/pages/    Survey taking, admin panel, plugin settings, privacy
 ```
 
 ## Tests
@@ -96,13 +99,13 @@ web/            React SPA
 cd api && npm test
 ```
 
-Covers Discord permission resolution, answer validation, response timing, result aggregation, and file-upload validation.
+Covers Discord permission resolution, answer validation, response timing, result aggregation, file-upload validation, password hashing, and TOTP (against the RFC 4226/6238 vectors).
 
 ## Notes
 
 Discord has no "who is in a channel" endpoint. The channel gate resolves a member's roles against the channel's permission overwrites, reproducing Discord's own calculation, including administrator bypass, owner bypass, member-specific overwrites, and thread inheritance.
 
-`docker-compose.preview.yml` is a local-development convenience that bypasses Discord sign-in. It only activates under `NODE_ENV=development` and the process refuses to start if that flag is set with any other environment, so it can never be enabled by accident on a real deployment.
+`docker-compose.preview.yml` is a local-development convenience that bypasses sign-in. It only activates under `NODE_ENV=development` and the process refuses to start if that flag is set with any other environment, so it can never be enabled by accident on a real deployment.
 
 ## License
 

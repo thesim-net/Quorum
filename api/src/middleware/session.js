@@ -2,10 +2,9 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { config } from '../config.js';
 import { query } from '../db/pool.js';
 import { current } from '../lib/settings.js';
+import { PLUGINS, isPluginEnabled } from '../lib/plugins.js';
 import { can, effectivePermissions, isSuper, TIERS } from '../lib/permissionSet.js';
-import { guildMetadata } from '../lib/gate.js';
-import { canViewChannel } from '../lib/permissions.js';
-import * as discord from '../lib/discord.js';
+import { discordTier, refreshSessionRoles } from '../plugins/discord/session.js';
 
 const COOKIE = 'quorum_sid';
 
@@ -42,71 +41,31 @@ function unsign(value) {
 }
 
 /**
- * Decides whether a member should have admin access.
+ * Combines a user's stored tier with whatever their sign-in method contributes.
  *
- * @param {string} discordId
- * @param {string[]} roleIds Roles the member currently holds.
- * @returns {boolean} True when the member is a bootstrap admin or holds an admin role.
+ * @param {string} storedTier The users.tier column.
+ * @param {string} pluginTier Tier contributed by an auth plugin, if any.
+ * @returns {string} The effective tier.
  */
-export function resolveTier(discordId, roleIds, storedTier, channelAdmin = false) {
-  // Local preview has no Discord to read roles from, so the bypass grants the
-  // top tier rather than leaving the panel unreachable.
+export function resolveTier(storedTier, pluginTier = TIERS.NONE) {
+  // Local preview has no accounts to read grants from, so the bypass grants
+  // the top tier rather than leaving the panel unreachable.
   if (config.devAuthBypass) return TIERS.SUPER;
 
-  // An explicit grant always wins; it is the only route to super admin.
-  if (storedTier === TIERS.SUPER) return TIERS.SUPER;
-  if (config.bootstrapAdminIds.includes(discordId)) return TIERS.SUPER;
-
-  // Role and channel derived access is deliberately capped at `admin`. An
-  // unrestricted account should never appear because someone joined a channel.
-  const adminRoleIds = current().adminRoleIds ?? config.adminRoleIds;
-  if (channelAdmin || roleIds.some((roleId) => adminRoleIds.includes(roleId))) {
-    return TIERS.ADMIN;
-  }
-
-  return storedTier === TIERS.ADMIN ? TIERS.ADMIN : TIERS.NONE;
+  if (storedTier === TIERS.SUPER || pluginTier === TIERS.SUPER) return TIERS.SUPER;
+  if (storedTier === TIERS.ADMIN || pluginTier === TIERS.ADMIN) return TIERS.ADMIN;
+  return TIERS.NONE;
 }
 
 /**
- * Whether a member's roles let them see any channel that grants admin access.
- *
- * @param {string[]} roleIds Roles held by the member.
- * @param {string} discordId
- * @returns {Promise<boolean>} True when one of the configured channels is visible.
- */
-async function grantedByChannel(roleIds, discordId) {
-  const channelIds = current().adminChannelIds ?? [];
-  if (channelIds.length === 0) return false;
-
-  try {
-    const meta = await guildMetadata();
-    return channelIds.some((channelId) => {
-      const channel = meta.channelsById.get(channelId);
-      if (!channel) return false;
-      return canViewChannel({
-        guild: meta.guild,
-        channel,
-        parentChannel: channel.parent_id ? meta.channelsById.get(channel.parent_id) ?? null : null,
-        memberRoleIds: roleIds,
-        memberId: discordId,
-        rolePermissions: meta.rolePermissions,
-      });
-    });
-  } catch {
-    // A Discord failure must not silently grant access.
-    return false;
-  }
-}
-
-/**
- * Creates a session for a member and sets the cookie.
+ * Creates a session for a user and sets the cookie.
  *
  * @param {import('express').Response} res
- * @param {{id: string, discordId: string}} user Persisted user row.
- * @param {string[]} roleIds Roles held at login.
+ * @param {{id: string}} user Persisted user row.
+ * @param {string[]} roleIds Discord roles held at login; empty for local accounts.
  * @returns {Promise<string>} The new session id.
  */
-export async function startSession(res, user, roleIds) {
+export async function startSession(res, user, roleIds = []) {
   const expiresAt = new Date(Date.now() + config.sessionTtlDays * 86_400_000);
 
   const { rows } = await query(
@@ -140,36 +99,11 @@ export async function endSession(req, res) {
 }
 
 /**
- * Re-reads a member's roles from Discord and updates the session snapshot.
- *
- * Also removes the session outright if the member has left the guild, so access
- * ends when membership does rather than at session expiry.
- *
- * @param {object} session Session row.
- * @param {string} discordId
- * @returns {Promise<string[]|null>} Current roles, or null when the member is
- *   no longer in the guild.
- */
-async function refreshRoles(session, discordId) {
-  const member = await discord.guildMember(discordId);
-  if (!member) {
-    await query('DELETE FROM sessions WHERE id = $1', [session.id]);
-    return null;
-  }
-
-  await query(
-    'UPDATE sessions SET role_ids = $2, roles_synced_at = now() WHERE id = $1',
-    [session.id, member.roles],
-  );
-  return member.roles;
-}
-
-/**
  * Populates `req.user` from the session cookie when one is present and valid.
  *
- * Never rejects a request on its own; routes that need a member use
- * `requireMember`. Roles are refreshed from Discord once the cached snapshot
- * ages past `ROLE_CACHE_SECONDS`.
+ * Never rejects a request on its own; routes that need an account use
+ * `requireMember`. For Discord-backed accounts, roles are refreshed through the
+ * discord plugin once the cached snapshot ages past `ROLE_CACHE_SECONDS`.
  *
  * @returns {import('express').RequestHandler} Express middleware.
  */
@@ -184,7 +118,8 @@ export function loadSession() {
       const { rows } = await query(
         `SELECT s.id, s.role_ids, s.roles_synced_at, s.expires_at,
                 u.id AS user_id, u.discord_id, u.username, u.display_name, u.avatar,
-                u.tier, u.permissions, u.prefs
+                u.tier, u.permissions, u.prefs,
+                u.password_hash IS NOT NULL AS has_password
            FROM sessions s
            JOIN users u ON u.id = s.user_id
           WHERE s.id = $1 AND s.expires_at > now()`,
@@ -194,28 +129,32 @@ export function loadSession() {
 
       const session = rows[0];
       let roleIds = session.role_ids;
+      let pluginTier = TIERS.NONE;
 
-      const ageMs = Date.now() - new Date(session.roles_synced_at).getTime();
-      if (!config.devAuthBypass && ageMs > config.roleCacheSeconds * 1000) {
-        // A Discord outage must not log everyone out, so fall back to the
-        // cached snapshot when the refresh fails.
-        try {
-          const refreshed = await refreshRoles(session, session.discord_id);
-          if (refreshed === null) return next();
-          roleIds = refreshed;
-        } catch (error) {
-          console.warn(`Role refresh failed for ${session.discord_id}: ${error.message}`);
+      const settings = current();
+      const discordActive =
+        Boolean(session.discord_id) &&
+        isPluginEnabled(settings.plugins, PLUGINS.DISCORD) &&
+        settings.discord.configured;
+
+      if (discordActive) {
+        const ageMs = Date.now() - new Date(session.roles_synced_at).getTime();
+        if (!config.devAuthBypass && ageMs > config.roleCacheSeconds * 1000) {
+          // A Discord outage must not log everyone out, so fall back to the
+          // cached snapshot when the refresh fails.
+          try {
+            const refreshed = await refreshSessionRoles(session, session.discord_id);
+            if (refreshed === null) return next();
+            roleIds = refreshed;
+          } catch (error) {
+            console.warn(`Role refresh failed for ${session.discord_id}: ${error.message}`);
+          }
         }
+
+        pluginTier = await discordTier(session, roleIds);
       }
 
-      // Only consult Discord about channel-granted access when the stored tier
-      // would not already cover it.
-      const channelAdmin =
-        session.tier === TIERS.SUPER
-          ? false
-          : await grantedByChannel(roleIds, session.discord_id);
-
-      const tier = resolveTier(session.discord_id, roleIds, session.tier, channelAdmin);
+      const tier = resolveTier(session.tier, pluginTier);
 
       req.user = {
         id: session.user_id,
@@ -225,6 +164,7 @@ export function loadSession() {
         avatar: session.avatar,
         roleIds,
         tier,
+        hasPassword: session.has_password,
         isSuperAdmin: isSuper({ tier }),
         // Retained for readability at call sites: "can reach the panel".
         isAdmin: tier !== TIERS.NONE,
@@ -240,12 +180,12 @@ export function loadSession() {
 }
 
 /**
- * Rejects the request unless a member is signed in.
+ * Rejects the request unless someone is signed in.
  *
  * @type {import('express').RequestHandler}
  */
 export function requireMember(req, res, next) {
-  if (!req.user) return res.status(401).json({ error: 'Sign in with Discord to continue.' });
+  if (!req.user) return res.status(401).json({ error: 'Sign in to continue.' });
   return next();
 }
 
@@ -253,12 +193,12 @@ export function requireMember(req, res, next) {
  * Rejects the request unless the caller is a full administrator.
  *
  * Reserved for actions that are not grantable: managing other admins, and
- * re-running setup.
+ * changing how the deployment is configured.
  *
  * @type {import('express').RequestHandler}
  */
 export function requireAdmin(req, res, next) {
-  if (!req.user) return res.status(401).json({ error: 'Sign in with Discord to continue.' });
+  if (!req.user) return res.status(401).json({ error: 'Sign in to continue.' });
   if (!req.user.isSuperAdmin) {
     return res.status(403).json({ error: 'Super administrator access required.' });
   }
@@ -274,7 +214,7 @@ export function requireAdmin(req, res, next) {
  * @type {import('express').RequestHandler}
  */
 export function requirePanel(req, res, next) {
-  if (!req.user) return res.status(401).json({ error: 'Sign in with Discord to continue.' });
+  if (!req.user) return res.status(401).json({ error: 'Sign in to continue.' });
   if (req.user.tier === TIERS.NONE) {
     return res.status(403).json({ error: 'Admin access required.' });
   }
@@ -289,7 +229,7 @@ export function requirePanel(req, res, next) {
  */
 export function requirePermission(permission) {
   return (req, res, next) => {
-    if (!req.user) return res.status(401).json({ error: 'Sign in with Discord to continue.' });
+    if (!req.user) return res.status(401).json({ error: 'Sign in to continue.' });
     if (!can(req.user, permission)) {
       return res.status(403).json({
         error: 'You do not have permission to do that.',

@@ -46,7 +46,9 @@ function isVisible(question, answers) {
  */
 function Disclosure({ disclosures }) {
   const items = [];
-  if (disclosures.identity) items.push('Your Discord username, attached to your answers.');
+  if (disclosures.identity) {
+    items.push('Your username, attached to your answers, if you are signed in.');
+  }
   if (disclosures.timing) items.push('How long you spend on each question.');
   if (disclosures.location) items.push('The country you are answering from.');
 
@@ -97,11 +99,15 @@ export function TakeSurvey() {
 
   const answersRef = useRef(answers);
   answersRef.current = answers;
+  const [errorCode, setErrorCode] = useState(null);
 
   useEffect(() => {
     api(`/surveys/${slug}`)
       .then(setIntro)
-      .catch((e) => setError(e.message));
+      .catch((e) => {
+        setError(e.message);
+        setErrorCode(e.payload?.code ?? null);
+      });
   }, [slug]);
 
   // While someone is answering, watch for the survey being closed under them.
@@ -262,6 +268,27 @@ export function TakeSurvey() {
       setBusy(false);
     }
   };
+
+  // A Discord-gated survey asks for the sign-in it needs rather than dead-ending.
+  if (error && !intro && errorCode === 'discord_login_required') {
+    return (
+      <div className="shell">
+        <div className="card">
+          <h1>Discord members only</h1>
+          <p className="muted">
+            This survey is restricted to certain members of our Discord server, so it needs you to
+            sign in with Discord first.
+          </p>
+          <a className="button primary" href="/api/auth/discord/login">
+            Sign in with Discord
+          </a>
+          <p style={{ marginTop: '1rem', marginBottom: 0 }}>
+            <Link to="/">Back to surveys</Link>
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   if (error && !intro) return <div className="shell"><div className="error">{error}</div></div>;
   if (!intro) return <div className="shell muted">Loading...</div>;

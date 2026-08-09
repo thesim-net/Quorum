@@ -2,11 +2,17 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api.js';
 
+/** Per-plugin settings pages, for the plugins that have one. */
+const SETTINGS_PAGES = {
+  discord: '/plugins/discord',
+};
+
 /**
  * Plugin management: enable or disable each plugin globally.
  *
  * A plugin an open survey depends on cannot be turned off; the server refuses
- * and the surveys using it are listed here so the admin knows why.
+ * and the surveys using it are listed here so the admin knows why. The same
+ * goes for dependencies: the announcement plugins need Discord Integration.
  *
  * @returns {JSX.Element} The page.
  */
@@ -48,7 +54,8 @@ export function Plugins() {
       setStatus(`${plugin.name} ${plugin.enabled ? 'disabled' : 'enabled'}.`);
       await load();
     } catch (e) {
-      // The server blocks disabling a plugin an open survey depends on.
+      // The server blocks disabling a plugin an open survey depends on, and
+      // enabling one whose dependency is off.
       if (e.payload?.activeSurveys) {
         setError(
           `${e.message} In use by: ${e.payload.activeSurveys.map((s) => s.title).join(', ')}.`,
@@ -62,6 +69,8 @@ export function Plugins() {
   };
 
   if (!plugins) return <div className="shell muted">Loading...</div>;
+
+  const enabledByKey = Object.fromEntries(plugins.map((p) => [p.key, p.enabled]));
 
   return (
     <div className="shell">
@@ -92,6 +101,12 @@ export function Plugins() {
               <p className="muted" style={{ margin: '0.3rem 0 0', fontSize: '0.9rem' }}>
                 {plugin.detail}
               </p>
+              {plugin.requires && !enabledByKey[plugin.requires] ? (
+                <p className="muted" style={{ fontSize: '0.82rem', marginBottom: 0 }}>
+                  Needs the {plugins.find((p) => p.key === plugin.requires)?.name ?? plugin.requires}{' '}
+                  plugin enabled first.
+                </p>
+              ) : null}
               {plugin.activeSurveys.length > 0 ? (
                 <p className="muted" style={{ fontSize: '0.82rem', marginBottom: 0 }}>
                   In use by {plugin.activeSurveys.length} open survey
@@ -100,6 +115,11 @@ export function Plugins() {
                 </p>
               ) : null}
             </div>
+            {SETTINGS_PAGES[plugin.key] ? (
+              <Link className="button" to={SETTINGS_PAGES[plugin.key]}>
+                Settings
+              </Link>
+            ) : null}
             <button
               type="button"
               className={plugin.enabled ? '' : 'primary'}

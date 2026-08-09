@@ -37,6 +37,15 @@ test('classifyPlugins discloses an enabled unlisted plugin as custom', () => {
   assert.deepEqual(custom, ['acme-extra']);
 });
 
+test('classifyPlugins treats the auth plugins as official, never custom', () => {
+  const { official, custom } = classifyPlugins({ discord: true, twofactor: true });
+  assert.deepEqual(
+    official.map((p) => p.key).sort(),
+    ['discord', 'twofactor'],
+  );
+  assert.equal(custom.length, 0);
+});
+
 test('classifyPlugins ignores disabled plugins and empty input', () => {
   assert.deepEqual(classifyPlugins({ raffle: false }), { official: [], custom: [] });
   assert.deepEqual(classifyPlugins(null), { official: [], custom: [] });

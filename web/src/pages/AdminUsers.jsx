@@ -8,16 +8,24 @@ import { api } from '../api.js';
  * granted permissions and never see that super admins exist, so the list a
  * plain admin sees is a strict subset filtered server-side.
  *
+ * Admins are created as local accounts (username plus a one-time password
+ * shown exactly once), or granted to a Discord member when that plugin is
+ * connected.
+ *
  * @returns {JSX.Element|null} The card, or null before the list loads.
  */
 export function AdminUsers() {
   const [data, setData] = useState(null);
+  const [mode, setMode] = useState('local');
+  const [username, setUsername] = useState('');
   const [discordId, setDiscordId] = useState('');
   const [superAdmin, setSuperAdmin] = useState(false);
   const [permissions, setPermissions] = useState([]);
   const [editing, setEditing] = useState(null);
   const [error, setError] = useState(null);
   const [status, setStatus] = useState(null);
+  // A freshly minted one-time password, shown until dismissed.
+  const [oneTime, setOneTime] = useState(null);
   const [busy, setBusy] = useState(false);
 
   /**
@@ -44,21 +52,28 @@ export function AdminUsers() {
   const toggle = (current, key) =>
     current.includes(key) ? current.filter((p) => p !== key) : [...current, key];
 
-  /** Grants access to the entered Discord user id. */
+  /** Creates a local admin, or grants access to a Discord member. */
   const add = async () => {
-    const id = discordId.trim();
-    if (!id) return;
-
     setBusy(true);
     setError(null);
     setStatus(null);
+    setOneTime(null);
     try {
-      const result = await api('/admin/admins', {
-        method: 'POST',
-        body: { discordId: id, superAdmin, permissions },
-      });
-      setStatus(`${result.username} now has access.`);
-      setDiscordId('');
+      if (mode === 'discord') {
+        const result = await api('/plugin/discord/admins', {
+          method: 'POST',
+          body: { discordId: discordId.trim(), superAdmin, permissions },
+        });
+        setStatus(`${result.username} now has access.`);
+        setDiscordId('');
+      } else {
+        const result = await api('/admin/admins', {
+          method: 'POST',
+          body: { username: username.trim(), superAdmin, permissions },
+        });
+        setOneTime({ username: result.username, password: result.password });
+        setUsername('');
+      }
       setSuperAdmin(false);
       setPermissions([]);
       await load();
@@ -105,9 +120,49 @@ export function AdminUsers() {
     }
   };
 
+  /**
+   * Resets a local admin's password to a fresh one-time value.
+   *
+   * @param {object} admin The admin whose password is reset.
+   */
+  const resetPassword = async (admin) => {
+    setError(null);
+    setStatus(null);
+    setOneTime(null);
+    try {
+      const result = await api(`/admin/admins/${admin.id}/password`, { method: 'POST' });
+      setOneTime({ username: result.username, password: result.password, reset: true });
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
+  /**
+   * Toggles whether an admin must use two-factor authentication.
+   *
+   * @param {object} admin The admin being changed.
+   */
+  const toggleTotpRequired = async (admin) => {
+    setError(null);
+    try {
+      await api(`/plugin/twofactor/require/${admin.id}`, {
+        method: 'PUT',
+        body: { required: !admin.totpRequired },
+      });
+      setStatus(
+        `2FA is ${admin.totpRequired ? 'no longer' : 'now'} required for ${admin.username}.`,
+      );
+      await load();
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
   if (!data) return null;
 
   const canManage = data.canManage;
+  const discordOn = Boolean(data.plugins?.discord);
+  const twofactorOn = Boolean(data.plugins?.twofactor);
 
   return (
     <div className="card">
@@ -116,18 +171,73 @@ export function AdminUsers() {
       {error ? <div className="error">{error}</div> : null}
       {status ? <p className="muted">{status}</p> : null}
 
+      {oneTime ? (
+        <div className="confirm" style={{ borderLeftColor: 'var(--accent)' }}>
+          <h3 style={{ color: 'var(--text-primary)' }}>
+            One-time password for {oneTime.username}
+          </h3>
+          <p>
+            {oneTime.reset ? 'The password has been reset.' : 'The account has been created.'} Hand
+            this password over securely; it is shown only once, and they should change it after
+            signing in.
+          </p>
+          <pre className="codeblock">{oneTime.password}</pre>
+          <button type="button" onClick={() => setOneTime(null)}>
+            I have copied it
+          </button>
+        </div>
+      ) : null}
+
       {canManage ? (
         <>
+          {discordOn ? (
+            <div className="row" style={{ marginBottom: '0.5rem' }}>
+              <label className="option-row" style={{ marginBottom: 0 }}>
+                <input
+                  type="radio"
+                  name="admin-add-mode"
+                  checked={mode === 'local'}
+                  onChange={() => setMode('local')}
+                />
+                <span>Local account</span>
+              </label>
+              <label className="option-row" style={{ marginBottom: 0 }}>
+                <input
+                  type="radio"
+                  name="admin-add-mode"
+                  checked={mode === 'discord'}
+                  onChange={() => setMode('discord')}
+                />
+                <span>Discord member</span>
+              </label>
+            </div>
+          ) : null}
+
           <div className="row" style={{ marginBottom: '0.5rem' }}>
-            <input
-              type="text"
-              placeholder="Discord user ID"
-              value={discordId}
-              onChange={(e) => setDiscordId(e.target.value)}
-              style={{ flex: 1 }}
-            />
-            <button type="button" className="primary" onClick={add} disabled={busy}>
-              {busy ? 'Checking...' : 'Add'}
+            {mode === 'discord' && discordOn ? (
+              <input
+                type="text"
+                placeholder="Discord user ID"
+                value={discordId}
+                onChange={(e) => setDiscordId(e.target.value)}
+                style={{ flex: 1 }}
+              />
+            ) : (
+              <input
+                type="text"
+                placeholder="Username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                style={{ flex: 1 }}
+              />
+            )}
+            <button
+              type="button"
+              className="primary"
+              onClick={add}
+              disabled={busy || (mode === 'discord' && discordOn ? !discordId.trim() : !username.trim())}
+            >
+              {busy ? 'Adding...' : 'Add'}
             </button>
           </div>
 
@@ -141,7 +251,7 @@ export function AdminUsers() {
               Super administrator
               <br />
               <span className="muted" style={{ fontSize: '0.82rem' }}>
-                Everything, including managing admins and re-running setup.
+                Everything, including managing admins and plugins.
               </span>
             </span>
           </label>
@@ -165,10 +275,17 @@ export function AdminUsers() {
             </div>
           )}
 
-          <p className="muted" style={{ fontSize: '0.82rem' }}>
-            Enable Developer Mode in Discord, then right-click a member and Copy User ID. They must
-            already be in the server.
-          </p>
+          {mode === 'discord' && discordOn ? (
+            <p className="muted" style={{ fontSize: '0.82rem' }}>
+              Enable Developer Mode in Discord, then right-click a member and Copy User ID. They
+              must already be in the server.
+            </p>
+          ) : (
+            <p className="muted" style={{ fontSize: '0.82rem' }}>
+              A one-time password is generated and shown once; the new admin signs in with it and
+              changes it.
+            </p>
+          )}
         </>
       ) : null}
 
@@ -189,7 +306,9 @@ export function AdminUsers() {
                   <span className="badge" style={{ marginLeft: '0.5rem' }}>You</span>
                 ) : null}
                 <br />
-                <span className="muted" style={{ fontSize: '0.8rem' }}>{admin.discordId}</span>
+                <span className="muted" style={{ fontSize: '0.8rem' }}>
+                  {admin.discordId ?? 'Local account'}
+                </span>
               </th>
               <td>
                 {admin.tier === 'super_admin' ? (
@@ -201,6 +320,15 @@ export function AdminUsers() {
                       .join(', ') || 'No permissions'}
                   </span>
                 )}
+                {twofactorOn ? (
+                  <>
+                    <br />
+                    <span className="muted" style={{ fontSize: '0.8rem' }}>
+                      2FA: {admin.totpEnrolled ? 'enrolled' : 'not enrolled'}
+                      {admin.totpRequired ? ', required' : ''}
+                    </span>
+                  </>
+                ) : null}
               </td>
               {canManage ? (
                 <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
@@ -224,6 +352,20 @@ export function AdminUsers() {
                       >
                         Edit
                       </button>{' '}
+                      {admin.local ? (
+                        <>
+                          <button type="button" onClick={() => resetPassword(admin)}>
+                            Reset password
+                          </button>{' '}
+                        </>
+                      ) : null}
+                      {twofactorOn ? (
+                        <>
+                          <button type="button" onClick={() => toggleTotpRequired(admin)}>
+                            {admin.totpRequired ? 'Unrequire 2FA' : 'Require 2FA'}
+                          </button>{' '}
+                        </>
+                      ) : null}
                       <button type="button" className="danger" onClick={() => remove(admin)}>
                         Remove
                       </button>
@@ -246,7 +388,9 @@ export function AdminUsers() {
               </td>
               {canManage ? (
                 <td style={{ textAlign: 'right' }}>
-                  <span className="muted" style={{ fontSize: '0.8rem' }}>Change in setup</span>
+                  <span className="muted" style={{ fontSize: '0.8rem' }}>
+                    Change in the Discord plugin settings
+                  </span>
                 </td>
               ) : null}
             </tr>
@@ -264,7 +408,9 @@ export function AdminUsers() {
               </td>
               {canManage ? (
                 <td style={{ textAlign: 'right' }}>
-                  <span className="muted" style={{ fontSize: '0.8rem' }}>Change in setup</span>
+                  <span className="muted" style={{ fontSize: '0.8rem' }}>
+                    Change in the Discord plugin settings
+                  </span>
                 </td>
               ) : null}
             </tr>
