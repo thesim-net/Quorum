@@ -882,7 +882,11 @@ select[multiple] {
   table-layout: fixed;
 }
 
-.shell,
+/* Cards sit in flex and grid contexts, where the default minimum size lets wide
+   content push them out of their container; this keeps them inside it.
+   Deliberately NOT applied to .shell: doing so overrides the page width set
+   above, and every admin tab then sizes itself to its own content, which is how
+   the tabs came to disagree with one another. */
 .card {
   min-width: 0;
   max-width: 100%;
