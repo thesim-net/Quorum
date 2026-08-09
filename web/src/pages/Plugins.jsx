@@ -4,7 +4,7 @@ import { api } from '../api.js';
 
 /** Per-plugin settings pages, for the plugins that have one. */
 const SETTINGS_PAGES = {
-  discord: '/plugins/discord',
+  discord: '/admin/plugins/discord',
 };
 
 /**
@@ -74,9 +74,6 @@ export function Plugins() {
 
   return (
     <div className="shell">
-      <p>
-        <Link to="/admin">Back to admin</Link>
-      </p>
       <h1>Plugins</h1>
       <p className="muted">
         Enable a plugin to make it available to your surveys. A plugin cannot be turned off while an

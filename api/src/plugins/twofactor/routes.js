@@ -162,11 +162,15 @@ twofactorAdminRouter.get('/status', async (req, res, next) => {
       [req.user.id],
     );
     const row = rows[0];
+    // The deployment-wide switch makes every admin required, on top of the
+    // per-account flag, so the account card can say it is mandated.
+    const globallyRequired =
+      Boolean(current().require2faAllAdmins) && req.user.tier !== TIERS.NONE;
     return res.json({
       enabled: twofactorEnabled(),
       enrolled: Boolean(row.has_secret && row.totp_confirmed_at),
       confirmedAt: row.totp_confirmed_at,
-      required: row.totp_required,
+      required: row.totp_required || globallyRequired,
     });
   } catch (error) {
     return next(error);
@@ -251,6 +255,12 @@ twofactorAdminRouter.post('/unenroll', async (req, res, next) => {
     if (user.totp_required) {
       return res.status(409).json({
         error: 'Two-factor authentication is required for this account. Ask another admin to lift it first.',
+      });
+    }
+    if (current().require2faAllAdmins && req.user.tier !== TIERS.NONE) {
+      return res.status(409).json({
+        error:
+          'Two-factor authentication is required for all administrators on this deployment, so it cannot be removed.',
       });
     }
 

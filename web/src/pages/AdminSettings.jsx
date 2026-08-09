@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api.js';
-import { AdminUsers } from './AdminUsers.jsx';
 import { TotpQr } from '../components/TotpQr.jsx';
 
 /**
@@ -84,6 +83,61 @@ function ChangePassword() {
 }
 
 /**
+ * Set or change the signed-in admin's local username.
+ *
+ * Available to everyone, including Discord-authenticated admins, so the local
+ * sign-in name can be chosen independently of the password.
+ *
+ * @param {{current: string|null, onChange: () => void}} props
+ * @returns {JSX.Element} The form.
+ */
+function SetUsername({ current, onChange }) {
+  const [username, setUsername] = useState(current ?? '');
+  const [error, setError] = useState(null);
+  const [status, setStatus] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  /** Submits the username change. */
+  const submit = async (event) => {
+    event.preventDefault();
+    setBusy(true);
+    setError(null);
+    setStatus(null);
+    try {
+      await api('/auth/username', { method: 'POST', body: { username: username.trim() } });
+      setStatus('Username saved.');
+      onChange?.();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form onSubmit={submit} style={{ marginTop: '1.25rem' }}>
+      <h3>{current ? 'Change username' : 'Set username'}</h3>
+      {error ? <div className="error">{error}</div> : null}
+      {status ? <p className="muted">{status}</p> : null}
+      <label>
+        <span className="field-label">
+          Username (3-32 characters: letters, numbers, dots, dashes, underscores)
+        </span>
+        <input
+          type="text"
+          value={username}
+          autoComplete="username"
+          onChange={(e) => setUsername(e.target.value)}
+        />
+      </label>
+      <button type="submit" disabled={busy || !username.trim() || username.trim() === current}>
+        {busy ? 'Saving...' : 'Save username'}
+      </button>
+    </form>
+  );
+}
+
+/**
  * The signed-in admin's own two-factor enrolment.
  *
  * Shows a QR code and the plain secret; a first valid code confirms. Removal
@@ -134,6 +188,9 @@ function TwoFactorAccount() {
       setEnrolment(null);
       setCode('');
       setStatus('Two-factor authentication is on.');
+      // Flip the status immediately rather than waiting on the refetch, so the
+      // section shows "Enabled" the moment the code is accepted.
+      setState((prev) => ({ ...(prev ?? {}), enrolled: true }));
       await load();
     } catch (e) {
       setError(e.message);
@@ -152,6 +209,7 @@ function TwoFactorAccount() {
       setRemoving(false);
       setCode('');
       setStatus('Two-factor authentication removed.');
+      setState((prev) => ({ ...(prev ?? {}), enrolled: false }));
       await load();
     } catch (e) {
       setError(e.message);
@@ -232,6 +290,71 @@ function TwoFactorAccount() {
 }
 
 /**
+ * Deployment-wide two-factor policy, super admins only.
+ *
+ * When on, every admin must complete 2FA at sign-in regardless of their own
+ * setting. It only takes effect while the Two-Factor Authentication plugin is
+ * enabled; with the plugin off it is stored but suspended.
+ *
+ * @returns {JSX.Element|null} The card, or null before the state loads.
+ */
+function TwoFactorPolicy() {
+  const [state, setState] = useState(null);
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = () =>
+    api('/admin/security')
+      .then(setState)
+      .catch(() => setState(null));
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  /** Flips the global requirement. */
+  const toggle = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api('/admin/security', {
+        method: 'PUT',
+        body: { require2faAllAdmins: !state.require2faAllAdmins },
+      });
+      await load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!state) return null;
+
+  return (
+    <div className="card">
+      <h2>Two-factor policy</h2>
+      {error ? <div className="error">{error}</div> : null}
+      <div className="row">
+        <span>
+          Require two-factor authentication for all administrators
+          <br />
+          <span className="muted" style={{ fontSize: '0.82rem' }}>
+            {state.twofactor
+              ? 'Every admin is asked to enrol and enter a code at their next sign-in.'
+              : 'Stored, but suspended until the Two-Factor Authentication plugin is enabled.'}
+          </span>
+        </span>
+        <span style={{ marginLeft: 'auto' }} />
+        <button type="button" disabled={busy} onClick={toggle}>
+          {state.require2faAllAdmins ? 'Turn off' : 'Turn on'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
  * Sign-in method toggles, super admins only.
  *
  * The server enforces the guard rails; this just surfaces its refusals.
@@ -285,7 +408,8 @@ function AuthMethods() {
           Username &amp; password
           <br />
           <span className="muted" style={{ fontSize: '0.82rem' }}>
-            Local admin accounts.
+            Every admin, including Discord admins, also holds a local username and password as a
+            fallback, so this can stay usable even if Discord sign-in is turned off.
           </span>
         </span>
         <span style={{ marginLeft: 'auto' }} />
@@ -314,9 +438,58 @@ function AuthMethods() {
 }
 
 /**
- * Administration: who has access, your own account, and how sign-in works.
+ * Deployment default for the animated wordmark, super admins only.
  *
- * Surveys live on their own page; nothing here is about running one.
+ * Framed for accessibility: the glitch animation is motion that can affect
+ * photosensitive viewers. A signed-in user's own preference overrides it.
+ *
+ * @param {{value: boolean, onChange: (next: boolean) => void}} props
+ * @returns {JSX.Element} The card.
+ */
+function AsciiAnimationDefault({ value, onChange }) {
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  /** Flips the deployment default. */
+  const toggle = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api('/admin/ascii-animation', { method: 'PUT', body: { enabled: !value } });
+      onChange(!value);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="card">
+      <h2>Appearance</h2>
+      {error ? <div className="error">{error}</div> : null}
+      <div className="row">
+        <span>
+          Animate the QUORUM wordmark by default
+          <br />
+          <span className="muted" style={{ fontSize: '0.82rem' }}>
+            The wordmark glitches with motion. Turn this off deployment-wide for photosensitive or
+            epilepsy-sensitive viewers. Anyone can still override it by clicking the wordmark, and a
+            reduced-motion browser setting is honoured for users with no preference of their own.
+          </span>
+        </span>
+        <span style={{ marginLeft: 'auto' }} />
+        <button type="button" disabled={busy} onClick={toggle}>
+          {value ? 'Turn off' : 'Turn on'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Settings tab: your own account, two-factor, sign-in methods, Discord, and
+ * appearance. Managing other admins, groups, and plugins live in their own tabs.
  *
  * @returns {JSX.Element} The page.
  */
@@ -325,22 +498,20 @@ export function AdminSettings() {
   const [account, setAccount] = useState(null);
   const [plugins, setPlugins] = useState({});
   const [discordStatus, setDiscordStatus] = useState(null);
-  const [version, setVersion] = useState('');
-  const [update, setUpdate] = useState(null);
-  const [showUpdate, setShowUpdate] = useState(false);
+  const [asciiDefault, setAsciiDefault] = useState(true);
 
-  useEffect(() => {
-    api('/admin/me').then(setMe).catch(() => setMe(null));
+  const loadAccount = () =>
     api('/auth/me')
       .then((data) => {
         setAccount(data.user);
         setPlugins(data.plugins ?? {});
+        setAsciiDefault(data.asciiAnimationDefault !== false);
       })
       .catch(() => setAccount(null));
-    api('/version').then((v) => setVersion(v.version)).catch(() => setVersion(''));
-    // Super-admin only on the server; a 403 for a plain admin just leaves the
-    // banner hidden.
-    api('/admin/update').then(setUpdate).catch(() => setUpdate(null));
+
+  useEffect(() => {
+    api('/admin/me').then(setMe).catch(() => setMe(null));
+    loadAccount();
   }, []);
 
   useEffect(() => {
@@ -352,56 +523,17 @@ export function AdminSettings() {
 
   return (
     <div className="shell">
-      <h1>Admin</h1>
-
-      {update?.updateAvailable ? (
-        <div className="update-banner">
-          <div className="row" style={{ justifyContent: 'space-between' }}>
-            <span>
-              <strong>Update available:</strong> Quorum {update.latest} (you have v{version}).
-            </span>
-            <span className="row" style={{ gap: '0.5rem' }}>
-              {update.url ? (
-                <a className="button" href={update.url} target="_blank" rel="noreferrer">
-                  Release notes
-                </a>
-              ) : null}
-              <button type="button" className="primary" onClick={() => setShowUpdate((v) => !v)}>
-                {showUpdate ? 'Hide' : 'Update'}
-              </button>
-            </span>
-          </div>
-
-          {showUpdate ? (
-            <div style={{ marginTop: '0.75rem' }}>
-              <p className="muted" style={{ marginTop: 0 }}>
-                From the folder holding your <code>docker-compose.yml</code>, run:
-              </p>
-              <pre className="codeblock">./update.sh</pre>
-              <p className="muted" style={{ fontSize: '0.82rem', marginBottom: 0 }}>
-                This pulls the new images and restarts. Database migrations run automatically when
-                the new version starts. Or run it by hand:{' '}
-                <code>docker compose pull && docker compose up -d</code>.
-              </p>
-            </div>
-          ) : null}
-        </div>
-      ) : null}
-
-      {/* Plain admins see a filtered, read-only version; the server decides
-          what is in it. */}
-      <AdminUsers />
+      <h1>Settings</h1>
 
       {/* The signed-in admin's own credentials. */}
       <div className="card">
         <h2>Your account</h2>
-        {account?.hasPassword ? <ChangePassword /> : (
-          <p className="muted">
-            You sign in with Discord, so there is no local password on this account.
-          </p>
-        )}
+        <ChangePassword />
+        <SetUsername current={account?.username ?? null} onChange={loadAccount} />
         {plugins.twofactor ? <TwoFactorAccount /> : null}
       </div>
+
+      {me.isSuperAdmin && plugins.twofactor ? <TwoFactorPolicy /> : null}
 
       {me.isSuperAdmin ? <AuthMethods /> : null}
 
@@ -418,27 +550,16 @@ export function AdminSettings() {
               </span>
             ) : null}
             <span style={{ marginLeft: 'auto' }} />
-            <Link className="button" to="/plugins/discord">
+            <Link className="button" to="/admin/plugins/discord">
               {discordStatus?.configured ? 'Manage connection' : 'Connect a server'}
             </Link>
           </div>
         </div>
       ) : null}
 
-      <div className="card">
-        <h2>About</h2>
-        <div className="row">
-          <span className="muted">Quorum version</span>
-          <span className="badge">{version ? `v${version}` : 'unknown'}</span>
-          <span style={{ marginLeft: 'auto' }} />
-          <Link className="button" to="/plugins">
-            Plugins
-          </Link>
-        </div>
-        <p className="muted" style={{ fontSize: '0.82rem', marginTop: '0.6rem' }}>
-          Automatic updates and migrations are planned.
-        </p>
-      </div>
+      {me.isSuperAdmin ? (
+        <AsciiAnimationDefault value={asciiDefault} onChange={setAsciiDefault} />
+      ) : null}
     </div>
   );
 }

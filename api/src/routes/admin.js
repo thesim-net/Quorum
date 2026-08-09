@@ -2,7 +2,14 @@ import { Router } from 'express';
 import { config } from '../config.js';
 import { query, transaction } from '../db/pool.js';
 import { generatePassword, hashPassword } from '../lib/passwords.js';
-import { current, effectiveAuthMethods, saveAuthMethods, savePlugins } from '../lib/settings.js';
+import {
+  current,
+  effectiveAuthMethods,
+  saveAsciiAnimationDefault,
+  saveAuthMethods,
+  savePlugins,
+  saveRequire2faAllAdmins,
+} from '../lib/settings.js';
 import {
   aggregateRanking,
   categorise,
@@ -18,7 +25,7 @@ import {
   sanitisePlugins,
 } from '../lib/plugins.js';
 import { updateStatus } from '../lib/update.js';
-import { requireAdmin, requirePanel, requirePermission } from '../middleware/session.js';
+import { requireAdmin, requirePanel } from '../middleware/session.js';
 import {
   ALL_PERMISSIONS,
   PERMISSIONS,
@@ -26,6 +33,15 @@ import {
   TIERS,
   sanitisePermissions,
 } from '../lib/permissionSet.js';
+import {
+  accessibleGroupIds,
+  effectivePermissionsForGroup,
+  loadGroupContext,
+  membershipWithFallback,
+  requireSurveyPermission,
+  resolveCreateGroup,
+} from '../lib/groups.js';
+import { groupsRouter } from './groups.js';
 import { postMessage } from '../plugins/discord/discord.js';
 import { adminDirectory, hasBootstrapSupers } from '../plugins/discord/session.js';
 
@@ -35,10 +51,15 @@ export const adminRouter = Router();
 // the specific one it needs.
 adminRouter.use(requirePanel);
 
-const writeSurveys = requirePermission(PERMISSIONS.SURVEYS_WRITE);
-const publishSurveys = requirePermission(PERMISSIONS.SURVEYS_PUBLISH);
-const deleteSurveys = requirePermission(PERMISSIONS.SURVEYS_DELETE);
-const readResults = requirePermission(PERMISSIONS.RESULTS_READ);
+// Group management is its own concern, super-admin gated inside the sub-router.
+adminRouter.use('/groups', groupsRouter);
+
+// Survey permissions are resolved against the group that owns each survey, so
+// these guards look the survey up rather than reading a global grant.
+const writeSurveys = requireSurveyPermission(PERMISSIONS.SURVEYS_WRITE);
+const publishSurveys = requireSurveyPermission(PERMISSIONS.SURVEYS_PUBLISH);
+const deleteSurveys = requireSurveyPermission(PERMISSIONS.SURVEYS_DELETE);
+const readResults = requireSurveyPermission(PERMISSIONS.RESULTS_READ);
 
 const USERNAME_PATTERN = /^[a-zA-Z0-9._-]{3,32}$/;
 
@@ -367,6 +388,59 @@ adminRouter.put('/auth-methods', requireAdmin, async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
+// Security policy
+// ---------------------------------------------------------------------------
+
+/** Reports the deployment-wide two-factor policy. */
+adminRouter.get('/security', requireAdmin, (_req, res) => {
+  const settings = current();
+  res.json({
+    require2faAllAdmins: settings.require2faAllAdmins,
+    twofactor: isPluginEnabled(settings.plugins, PLUGINS.TWOFACTOR),
+  });
+});
+
+/**
+ * Sets whether every administrator must use two-factor authentication.
+ *
+ * Like the per-account requirement, this only bites while the twofactor plugin
+ * is enabled; with the plugin off it is stored but suspended.
+ */
+adminRouter.put('/security', requireAdmin, async (req, res, next) => {
+  try {
+    const require2faAllAdmins = req.body?.require2faAllAdmins === true;
+    await saveRequire2faAllAdmins(require2faAllAdmins);
+    await audit(req.user.id, 'security.require_2fa', 'settings', 'app_settings', {
+      require2faAllAdmins,
+    });
+    return res.json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Appearance
+// ---------------------------------------------------------------------------
+
+/**
+ * Sets the deployment default for the animated wordmark.
+ *
+ * An accessibility control (photosensitivity/epilepsy): a signed-in user's own
+ * preference still overrides this default.
+ */
+adminRouter.put('/ascii-animation', requireAdmin, async (req, res, next) => {
+  try {
+    const enabled = req.body?.enabled !== false;
+    await saveAsciiAnimationDefault(enabled);
+    await audit(req.user.id, 'appearance.ascii_animation', 'settings', 'app_settings', { enabled });
+    return res.json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Admins
 // ---------------------------------------------------------------------------
 
@@ -622,12 +696,25 @@ adminRouter.patch('/admins/:userId', requireAdmin, async (req, res, next) => {
 // Surveys
 // ---------------------------------------------------------------------------
 
-/** Lists every survey with headline response counts. */
-adminRouter.get('/surveys', async (_req, res, next) => {
+/**
+ * Lists surveys the caller can reach, with headline response counts.
+ *
+ * A survey is visible when it belongs to one of the caller's groups or to a
+ * group they hold a grant onto; super admins see everything. Each row carries
+ * the caller's own permissions over its owning group, so the client can show
+ * only the actions that survey allows them.
+ */
+adminRouter.get('/surveys', async (req, res, next) => {
   try {
+    const context = await loadGroupContext(req.user.id);
+    const membership = membershipWithFallback(req.user, context.membership, context.defaultGroup);
+    const accessible = req.user.isSuperAdmin
+      ? null
+      : accessibleGroupIds(req.user, membership, context.grants);
+
     const { rows } = await query(
       `SELECT s.id, s.slug, s.title, s.status, s.created_at, s.closes_at,
-              s.opens_at,
+              s.opens_at, s.group_id, gr.name AS group_name,
               s.collect_timing, s.collect_location, s.collect_identity,
               s.allow_response_edits, s.gate_role_ids, s.gate_channel_ids,
               -- Both joins fan out, so every count here must be DISTINCT or the
@@ -636,52 +723,81 @@ adminRouter.get('/surveys', async (_req, res, next) => {
               count(DISTINCT r.id)                                       AS started,
               count(DISTINCT r.id) FILTER (WHERE r.status = 'completed') AS completed
          FROM surveys s
+         LEFT JOIN groups gr ON gr.id = s.group_id
          LEFT JOIN questions q ON q.survey_id = s.id
          LEFT JOIN responses r ON r.survey_id = s.id
-        GROUP BY s.id
+        GROUP BY s.id, gr.name
         ORDER BY s.created_at DESC`,
     );
 
+    // Permissions are the same for every survey in a group, so resolve once.
+    const permsByGroup = new Map();
+    const permsFor = (groupId) => {
+      if (req.user.isSuperAdmin) return ALL_PERMISSIONS;
+      if (!permsByGroup.has(groupId)) {
+        permsByGroup.set(groupId, [
+          ...effectivePermissionsForGroup(req.user, groupId, membership, context.grants),
+        ]);
+      }
+      return permsByGroup.get(groupId);
+    };
+
     res.json({
-      surveys: rows.map((row) => ({
-        id: row.id,
-        slug: row.slug,
-        title: row.title,
-        status: row.status,
-        createdAt: row.created_at,
-        opensAt: row.opens_at,
-        closesAt: row.closes_at,
-        state: liveState(row),
-        gated: row.gate_role_ids.length > 0 || row.gate_channel_ids.length > 0,
-        questionCount: Number(row.question_count),
-        started: Number(row.started),
-        completed: Number(row.completed),
-        collect: {
-          timing: row.collect_timing,
-          location: row.collect_location,
-          identity: row.collect_identity,
-        },
-        allowsEdits: row.allow_response_edits,
-      })),
+      surveys: rows
+        .filter((row) => accessible === null || accessible.has(row.group_id))
+        .map((row) => ({
+          id: row.id,
+          slug: row.slug,
+          title: row.title,
+          status: row.status,
+          createdAt: row.created_at,
+          opensAt: row.opens_at,
+          closesAt: row.closes_at,
+          state: liveState(row),
+          gated: row.gate_role_ids.length > 0 || row.gate_channel_ids.length > 0,
+          questionCount: Number(row.question_count),
+          started: Number(row.started),
+          completed: Number(row.completed),
+          groupId: row.group_id,
+          groupName: row.group_name,
+          permissions: permsFor(row.group_id),
+          collect: {
+            timing: row.collect_timing,
+            location: row.collect_location,
+            identity: row.collect_identity,
+          },
+          allowsEdits: row.allow_response_edits,
+        })),
     });
   } catch (error) {
     next(error);
   }
 });
 
-/** Creates a draft survey. */
-adminRouter.post('/surveys', writeSurveys, async (req, res, next) => {
+/**
+ * Creates a draft survey in a group.
+ *
+ * The owning group comes from the request or defaults to the caller's own
+ * group; either way they must hold surveys.write over it.
+ */
+adminRouter.post('/surveys', async (req, res, next) => {
   try {
     const title = String(req.body?.title ?? '').trim();
     if (!title) return res.status(400).json({ error: 'A title is required.' });
 
+    const target = await resolveCreateGroup(req.user, req.body?.groupId);
+    if (target.error) return res.status(target.status).json({ error: target.error });
+
     const { rows } = await query(
-      `INSERT INTO surveys (slug, title, description, created_by)
-       VALUES ($1, $2, $3, $4) RETURNING id, slug`,
-      [slugify(title), title, String(req.body?.description ?? ''), req.user.id],
+      `INSERT INTO surveys (slug, title, description, created_by, group_id)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id, slug`,
+      [slugify(title), title, String(req.body?.description ?? ''), req.user.id, target.groupId],
     );
 
-    await audit(req.user.id, 'survey.create', 'survey', rows[0].id, { title });
+    await audit(req.user.id, 'survey.create', 'survey', rows[0].id, {
+      title,
+      groupId: target.groupId,
+    });
     return res.status(201).json({ survey: rows[0] });
   } catch (error) {
     return next(error);

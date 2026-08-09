@@ -152,7 +152,7 @@ export function DiscordSettings() {
   return (
     <div className="shell">
       <p>
-        <Link to="/plugins">Back to plugins</Link>
+        <Link to="/admin/plugins">Back to plugins</Link>
       </p>
       <h1>Discord Integration</h1>
 
@@ -162,7 +162,7 @@ export function DiscordSettings() {
           <p className="muted" style={{ margin: 0 }}>
             The Discord Integration plugin is currently disabled. The connection can be set up
             here, but Discord sign-in and survey gates stay off until the plugin is enabled on
-            the <Link to="/plugins">plugins page</Link>.
+            the <Link to="/admin/plugins">plugins page</Link>.
           </p>
         </div>
       )}

@@ -101,14 +101,17 @@ discordAuthRouter.get('/callback', async (req, res, next) => {
       `INSERT INTO users (discord_id, username, display_name, avatar, tier, last_login_at)
             VALUES ($1, $2, $3, $4, $5, now())
        ON CONFLICT (discord_id) DO UPDATE
-            SET username = EXCLUDED.username,
+            -- A local password means the username was chosen for local sign-in,
+            -- so it is kept rather than overwritten from Discord each login.
+            SET username = CASE WHEN users.password_hash IS NULL
+                                THEN EXCLUDED.username ELSE users.username END,
                 display_name = EXCLUDED.display_name,
                 avatar = EXCLUDED.avatar,
                 -- A stored tier is never lowered by a later login. Role and
                 -- channel derived access is recomputed per request instead.
                 tier = GREATEST(users.tier, EXCLUDED.tier),
                 last_login_at = now()
-         RETURNING id, discord_id, totp_required, totp_secret_enc, totp_confirmed_at`,
+         RETURNING id, discord_id, tier, totp_required, totp_secret_enc, totp_confirmed_at`,
       [
         profile.id,
         profile.username,

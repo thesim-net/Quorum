@@ -630,7 +630,7 @@ export function SurveyEditor() {
   return (
     <div className="shell">
       <p>
-        <Link to="/surveys">Back to surveys</Link>
+        <Link to="/admin/surveys">Back to surveys</Link>
       </p>
       <h1>Edit survey</h1>
 

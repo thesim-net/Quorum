@@ -41,7 +41,13 @@ export async function loadSettings() {
     discord: row?.auth_methods ? Boolean(row.auth_methods.discord) : discord.configured,
   };
 
-  cache = { plugins, authMethods, discord };
+  // Accessibility default for the animated wordmark, and the deployment-wide
+  // two-factor policy. Both default to their pre-feature behaviour when the
+  // column is absent on an older row.
+  const asciiAnimationDefault = row?.ascii_animation_default ?? true;
+  const require2faAllAdmins = Boolean(row?.require_2fa_all_admins);
+
+  cache = { plugins, authMethods, discord, asciiAnimationDefault, require2faAllAdmins };
   return cache;
 }
 
@@ -103,6 +109,36 @@ export async function saveAuthMethods(methods) {
     `INSERT INTO app_settings (id, auth_methods) VALUES (true, $1)
      ON CONFLICT (id) DO UPDATE SET auth_methods = $1, updated_at = now()`,
     [methods],
+  );
+  return loadSettings();
+}
+
+/**
+ * Persists the default for the animated wordmark and refreshes the cache.
+ *
+ * @param {boolean} enabled Whether the wordmark animates by default.
+ * @returns {Promise<object>} The reloaded settings.
+ */
+export async function saveAsciiAnimationDefault(enabled) {
+  await query(
+    `INSERT INTO app_settings (id, ascii_animation_default) VALUES (true, $1)
+     ON CONFLICT (id) DO UPDATE SET ascii_animation_default = $1, updated_at = now()`,
+    [enabled],
+  );
+  return loadSettings();
+}
+
+/**
+ * Persists the deployment-wide two-factor policy and refreshes the cache.
+ *
+ * @param {boolean} required Whether every admin must use 2FA.
+ * @returns {Promise<object>} The reloaded settings.
+ */
+export async function saveRequire2faAllAdmins(required) {
+  await query(
+    `INSERT INTO app_settings (id, require_2fa_all_admins) VALUES (true, $1)
+     ON CONFLICT (id) DO UPDATE SET require_2fa_all_admins = $1, updated_at = now()`,
+    [required],
   );
   return loadSettings();
 }

@@ -2,6 +2,11 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { config } from '../../config.js';
 import { current } from '../../lib/settings.js';
 import { PLUGINS, isPluginEnabled } from '../../lib/plugins.js';
+import { TIERS } from '../../lib/permissionSet.js';
+import { effectiveRequirement } from './policy.js';
+
+// Re-exported so the requirement policy is reachable through this module too.
+export { effectiveRequirement };
 
 /**
  * Two-factor login challenges.
@@ -24,16 +29,26 @@ export const twofactorEnabled = () => isPluginEnabled(current().plugins, PLUGINS
  *
  * Required accounts are challenged even before they finish enrolling: the
  * challenge flow lets them enrol on the spot, so requiring 2FA can never be
- * bypassed by simply not setting it up.
+ * bypassed by simply not setting it up. The deployment-wide "require for all
+ * admins" switch is applied here too, so turning it on forces every admin
+ * account through 2FA at its next sign-in.
  *
- * @param {{totp_required: boolean, totp_secret_enc: Buffer|null,
+ * @param {{tier?: string, totp_required: boolean, totp_secret_enc: Buffer|null,
  *   totp_confirmed_at: Date|null}} userRow
  * @returns {boolean} True when a challenge must be issued.
  */
 export function challengeRequired(userRow) {
-  if (!twofactorEnabled()) return false;
-  if (userRow.totp_required) return true;
-  return Boolean(userRow.totp_secret_enc && userRow.totp_confirmed_at);
+  const settings = current();
+  return effectiveRequirement({
+    pluginEnabled: isPluginEnabled(settings.plugins, PLUGINS.TWOFACTOR),
+    requireAllAdmins: Boolean(settings.require2faAllAdmins),
+    // Only accounts that can reach the panel are forced by the global switch.
+    // An unknown tier (a caller that did not select it) is treated as not an
+    // admin, so the global switch never challenges a plain member.
+    isAdmin: userRow.tier != null && userRow.tier !== TIERS.NONE,
+    totpRequired: Boolean(userRow.totp_required),
+    enrolled: Boolean(userRow.totp_secret_enc && userRow.totp_confirmed_at),
+  });
 }
 
 /**

@@ -54,12 +54,28 @@ export function AdminSurveys() {
   const navigate = useNavigate();
 
   /**
-   * Whether the signed-in admin holds a permission.
+   * Whether the signed-in admin holds a permission at all, for coarse gating
+   * such as showing the create box.
    *
    * @param {string} permission
    * @returns {boolean} True when the action should be offered.
    */
   const can = (permission) => Boolean(me?.permissions?.includes(permission));
+
+  /**
+   * Whether the admin holds a permission over a specific survey.
+   *
+   * Permissions are scoped to the survey's owning group, so each row carries its
+   * own set; the global list is only a fallback for older responses.
+   *
+   * @param {object} survey The survey row.
+   * @param {string} permission
+   * @returns {boolean} True when the action should be offered for that survey.
+   */
+  const surveyCan = (survey, permission) =>
+    Array.isArray(survey.permissions)
+      ? survey.permissions.includes(permission)
+      : can(permission);
 
   /**
    * Reloads the survey list.
@@ -215,6 +231,7 @@ export function AdminSurveys() {
             {survey.collect.timing ? <span className="badge">Timing</span> : null}
             {survey.collect.location ? <span className="badge">Country</span> : null}
             {survey.gated ? <span className="badge">Restricted</span> : null}
+            {survey.groupName ? <span className="badge">{survey.groupName}</span> : null}
           </div>
 
           <p className="muted">
@@ -234,17 +251,17 @@ export function AdminSurveys() {
           ) : null}
 
           <div className="row">
-            {can('surveys.write') ? (
+            {surveyCan(survey, 'surveys.write') ? (
               <Link className="button" to={`/admin/surveys/${survey.id}`}>
                 Edit
               </Link>
             ) : null}
-            {can('results.read') ? (
+            {surveyCan(survey, 'results.read') ? (
               <Link className="button" to={`/admin/surveys/${survey.id}/results`}>
                 Results
               </Link>
             ) : null}
-            {can('surveys.publish') ? (
+            {surveyCan(survey, 'surveys.publish') ? (
               <button
                 type="button"
                 onClick={() => setStatus(survey.id, survey.status === 'open' ? 'closed' : 'open')}
@@ -252,7 +269,7 @@ export function AdminSurveys() {
                 {survey.status === 'open' ? 'Close' : 'Open'}
               </button>
             ) : null}
-            {can('surveys.delete') ? (
+            {surveyCan(survey, 'surveys.delete') ? (
               <button
                 type="button"
                 className="danger"
