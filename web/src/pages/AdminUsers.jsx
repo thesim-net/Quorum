@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api.js';
 import { removalConsequences } from '../lib/removal.js';
@@ -383,12 +383,12 @@ export function AdminUsers() {
           <tr>
             <th scope="col">Admin</th>
             <th scope="col">Access</th>
-            {canManage ? <th scope="col" /> : null}
           </tr>
         </thead>
         <tbody>
           {data.granted.map((admin) => (
-            <tr key={admin.id}>
+            <Fragment key={admin.id}>
+            <tr>
               <th scope="row" style={{ display: 'table-cell' }}>
                 {admin.displayName || admin.username}
                 {admin.isSelf ? (
@@ -444,12 +444,17 @@ export function AdminUsers() {
                   </>
                 ) : null}
               </td>
-              {canManage ? (
-                <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+            </tr>
+            {/* The actions live on their own full-width row rather than in a
+                third column: four buttons cannot share a row with the account
+                details without running past the edge of the page. */}
+            {canManage ? (
+              <tr className="row-actions">
+                <td colSpan={2}>
                   {admin.isSelf ? (
                     <span className="muted" style={{ fontSize: '0.8rem' }}>Ask another admin</span>
                   ) : (
-                    <>
+                    <div className="row-buttons">
                       <button
                         type="button"
                         onClick={() =>
@@ -498,11 +503,12 @@ export function AdminUsers() {
                       >
                         Remove
                       </button>
-                    </>
+                    </div>
                   )}
                 </td>
-              ) : null}
-            </tr>
+              </tr>
+            ) : null}
+            </Fragment>
           ))}
 
           {data.adminRoles.map((role) => (
@@ -515,15 +521,14 @@ export function AdminUsers() {
                   Discord role - administrator, not super admin
                   <br />
                   In no group, so {defaultGroupName} applies until they are added to one.
+                  {canManage ? (
+                    <>
+                      <br />
+                      Change this in the Discord plugin settings.
+                    </>
+                  ) : null}
                 </span>
               </td>
-              {canManage ? (
-                <td style={{ textAlign: 'right' }}>
-                  <span className="muted" style={{ fontSize: '0.8rem' }}>
-                    Change in the Discord plugin settings
-                  </span>
-                </td>
-              ) : null}
             </tr>
           ))}
 
@@ -537,15 +542,14 @@ export function AdminUsers() {
                   Discord channel - administrator, not super admin
                   <br />
                   In no group, so {defaultGroupName} applies until they are added to one.
+                  {canManage ? (
+                    <>
+                      <br />
+                      Change this in the Discord plugin settings.
+                    </>
+                  ) : null}
                 </span>
               </td>
-              {canManage ? (
-                <td style={{ textAlign: 'right' }}>
-                  <span className="muted" style={{ fontSize: '0.8rem' }}>
-                    Change in the Discord plugin settings
-                  </span>
-                </td>
-              ) : null}
             </tr>
           ))}
 
@@ -559,7 +563,6 @@ export function AdminUsers() {
                   BOOTSTRAP_ADMIN_IDS - super admin
                 </span>
               </td>
-              {canManage ? <td /> : null}
             </tr>
           ))}
         </tbody>
