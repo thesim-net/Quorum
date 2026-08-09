@@ -1,22 +1,42 @@
 import { Router } from 'express';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { config } from '../../config.js';
 import { query } from '../../db/pool.js';
 import { mask } from '../../lib/secretbox.js';
+import { canUnlinkDiscord } from '../../lib/onboarding.js';
 import { current, effectiveAuthMethods } from '../../lib/settings.js';
 import { PLUGINS, isPluginEnabled } from '../../lib/plugins.js';
 import { PERMISSIONS, TIERS, sanitisePermissions } from '../../lib/permissionSet.js';
 import {
   newStateToken,
   requireAdmin,
+  requireMember,
   requirePermission,
   startSession,
 } from '../../middleware/session.js';
 import { challengeRequired, issueChallenge } from '../twofactor/twofactor.js';
 import * as discord from './discord.js';
 import { guildMetadata, invalidateGuildCache } from './gate.js';
+import {
+  CALLBACK_ACTIONS,
+  INTENTS,
+  decodeState,
+  encodeState,
+  resolveCallback,
+  resolveLink,
+} from './link.js';
 import { resetDiscordSettings, saveDiscordSettings } from './settings.js';
 
 const STATE_COOKIE = 'quorum_state';
+
+// A Discord identity that has been verified but not yet attached to anything.
+// Held in a signed cookie between the callback and the POST that completes the
+// link, so the account is only changed by a deliberate action in the panel.
+const PENDING_COOKIE = 'quorum_link';
+const PENDING_TTL_MS = 5 * 60_000;
+
+// The page the link half of the flow reports back to.
+const LINK_PAGE = '/admin/link-discord';
 
 /** Whether Discord sign-in can be offered right now. */
 const loginAvailable = () => effectiveAuthMethods().discord;
@@ -44,21 +64,78 @@ async function audit(actorId, action, targetType, targetId, meta = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// OAuth sign-in, mounted at /api/auth/discord
+// OAuth sign-in and account linking, mounted at /api/auth/discord
 // ---------------------------------------------------------------------------
 
 export const discordAuthRouter = Router();
 
 /**
- * Starts the Discord OAuth flow.
+ * Signs a pending-link payload.
  *
- * The CSRF state token is stored in a short-lived cookie and compared on the
- * callback, so a forged callback cannot complete a login.
+ * The HMAC context is its own, so neither the session cookie nor the two-factor
+ * challenge can be replayed as a pending link or the other way round.
+ *
+ * @param {string} payload `userId.discordId.expiresMs`.
+ * @returns {string} URL-safe signature.
  */
-discordAuthRouter.get('/login', (req, res) => {
-  if (!loginAvailable()) return res.redirect('/login?error=discord_unavailable');
+const signPending = (payload) =>
+  createHmac('sha256', config.sessionSecret).update(`discordlink:${payload}`).digest('base64url');
 
-  const state = newStateToken();
+/**
+ * Hands a verified Discord identity back to the browser, bound to one account.
+ *
+ * Binding it to the user id means a pending link created for one account cannot
+ * be completed by whoever signs in next on the same browser.
+ *
+ * @param {import('express').Response} res
+ * @param {string} userId Account the link was started from.
+ * @param {string} discordId The verified Discord user id.
+ * @returns {void}
+ */
+function issuePendingLink(res, userId, discordId) {
+  const payload = `${userId}.${discordId}.${Date.now() + PENDING_TTL_MS}`;
+  res.cookie(PENDING_COOKIE, `${payload}.${signPending(payload)}`, {
+    httpOnly: true,
+    secure: config.publicUrl.startsWith('https://'),
+    sameSite: 'lax',
+    maxAge: PENDING_TTL_MS,
+    path: '/',
+  });
+}
+
+/**
+ * Reads and verifies the pending-link cookie.
+ *
+ * @param {import('express').Request} req
+ * @returns {{userId: string, discordId: string}|null} The pending link, or null
+ *   when absent, forged, or expired.
+ */
+function readPendingLink(req) {
+  // A uuid holds no dots and a Discord id is digits, so the four parts are
+  // unambiguous.
+  const parts = String(req.cookies?.[PENDING_COOKIE] ?? '').split('.');
+  if (parts.length !== 4) return null;
+
+  const [userId, discordId, expires, signature] = parts;
+  const expected = signPending(`${userId}.${discordId}.${expires}`);
+
+  const a = Buffer.from(signature);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
+  if (!/^\d+$/.test(expires) || Number(expires) < Date.now()) return null;
+
+  return { userId, discordId };
+}
+
+/**
+ * Sets the state cookie and sends the browser to Discord.
+ *
+ * @param {import('express').Response} res
+ * @param {string} intent An INTENTS value, carried inside the state.
+ * @returns {void}
+ */
+function beginOauth(res, intent) {
+  const state = encodeState(intent, newStateToken());
 
   res.cookie(STATE_COOKIE, state, {
     httpOnly: true,
@@ -68,68 +145,272 @@ discordAuthRouter.get('/login', (req, res) => {
     path: '/',
   });
 
-  return res.redirect(discord.authorizeUrl(state));
+  // Linking always shows Discord's consent screen, so the admin sees which
+  // account they are about to attach and can switch before they do.
+  res.redirect(discord.authorizeUrl(state, intent === INTENTS.LINK ? 'consent' : 'none'));
+}
+
+/**
+ * Starts the Discord OAuth flow to sign in.
+ *
+ * The CSRF state token is stored in a short-lived cookie and compared on the
+ * callback, so a forged callback cannot complete a login.
+ */
+discordAuthRouter.get('/login', (req, res) => {
+  if (!loginAvailable()) return res.redirect('/login?error=discord_unavailable');
+  return beginOauth(res, INTENTS.SIGN_IN);
 });
 
 /**
- * Completes the OAuth flow.
+ * Starts the Discord OAuth flow to link an identity to the current account.
+ *
+ * The same registered redirect URI is reused; only the intent inside the state
+ * differs. Linking is not signing in, so it stays available even where the
+ * Discord sign-in method is switched off: the forced link step must never be a
+ * dead end for the admin being shown it.
+ */
+discordAuthRouter.get('/link', (req, res) => {
+  // A navigation, not an API call, so a signed-out caller is sent to sign in
+  // rather than handed a 401 body.
+  if (!req.user) return res.redirect('/login');
+  if (!pluginReady()) return res.redirect(`${LINK_PAGE}?error=discord_unavailable`);
+  return beginOauth(res, INTENTS.LINK);
+});
+
+/**
+ * Refreshes the profile copy held for a returning Discord account.
+ *
+ * @param {string} userId The account the discord_id already belongs to.
+ * @param {object} profile Discord user object.
+ * @param {object} member Guild member object.
+ * @returns {Promise<object>} The row the sign-in decision needs.
+ */
+async function refreshOnSignIn(userId, profile, member) {
+  const { rows } = await query(
+    `UPDATE users
+        -- A local password means the username was chosen for local sign-in,
+        -- so it is kept rather than overwritten from Discord each login.
+        SET username = CASE WHEN password_hash IS NULL THEN $2 ELSE username END,
+            display_name = $3,
+            avatar = $4,
+            last_login_at = now()
+      WHERE id = $1
+      RETURNING id, discord_id, tier, totp_required, totp_secret_enc, totp_confirmed_at`,
+    [userId, profile.username, member.nick ?? profile.global_name ?? null, profile.avatar],
+  );
+  return rows[0];
+}
+
+/**
+ * Creates the account for a BOOTSTRAP_ADMIN_IDS member on their first sign-in.
+ *
+ * The only Discord id allowed to mint an account. The tier stays `none`
+ * because a bootstrap id resolves to super admin per request, from the
+ * environment rather than from a stored grant.
+ *
+ * @param {object} profile Discord user object.
+ * @param {object} member Guild member object.
+ * @returns {Promise<object>} The row the sign-in decision needs.
+ */
+async function createBootstrapUser(profile, member) {
+  const { rows } = await query(
+    `INSERT INTO users (discord_id, username, display_name, avatar, tier, last_login_at)
+          VALUES ($1, $2, $3, $4, $5, now())
+     -- Two simultaneous first sign-ins would otherwise race the UNIQUE index.
+     ON CONFLICT (discord_id) DO UPDATE
+          SET display_name = EXCLUDED.display_name,
+              avatar = EXCLUDED.avatar,
+              last_login_at = now()
+       RETURNING id, discord_id, tier, totp_required, totp_secret_enc, totp_confirmed_at`,
+    [
+      profile.id,
+      profile.username,
+      member.nick ?? profile.global_name ?? null,
+      profile.avatar,
+      TIERS.NONE,
+    ],
+  );
+  return rows[0];
+}
+
+/**
+ * Completes the OAuth flow, for both sign-in and linking.
  *
  * Guild membership is checked with the bot token rather than the member's OAuth
  * token, so a token minted by another application cannot be replayed here. When
  * the twofactor plugin requires it, the session is withheld until the code is
  * entered.
+ *
+ * An unrecognised Discord id signs nobody in and creates nothing: the sign-in
+ * page explains that the account has to be linked from a signed-in session.
  */
 discordAuthRouter.get('/callback', async (req, res, next) => {
   try {
-    if (!loginAvailable()) return res.redirect('/login?error=discord_unavailable');
-
     const { code, state } = req.query;
     const expected = req.cookies?.[STATE_COOKIE];
     res.clearCookie(STATE_COOKIE, { path: '/' });
 
-    if (!code || !state || state !== expected) {
-      return res.redirect('/login?error=invalid_state');
+    const decoded = decodeState(state);
+    // The intent is only believed once the whole state matches the cookie this
+    // server set, so a crafted callback cannot turn a sign-in into a link.
+    if (!code || !state || !decoded || state !== expected) {
+      return res.redirect(
+        req.user ? `${LINK_PAGE}?error=invalid_state` : '/login?error=invalid_state',
+      );
     }
+
+    const linking = decoded.intent === INTENTS.LINK;
+    /** Reports a failure on whichever page started this round trip. */
+    const fail = (reason) =>
+      res.redirect(linking ? `${LINK_PAGE}?error=${reason}` : `/login?error=${reason}`);
+
+    if (linking ? !pluginReady() : !loginAvailable()) return fail('discord_unavailable');
 
     const token = await discord.exchangeCode(String(code));
     const profile = await discord.currentUser(token.access_token);
 
     const member = await discord.guildMember(profile.id);
-    if (!member) return res.redirect('/login?error=not_in_guild');
+    if (!member) return fail('not_in_guild');
 
-    const { rows } = await query(
-      `INSERT INTO users (discord_id, username, display_name, avatar, tier, last_login_at)
-            VALUES ($1, $2, $3, $4, $5, now())
-       ON CONFLICT (discord_id) DO UPDATE
-            -- A local password means the username was chosen for local sign-in,
-            -- so it is kept rather than overwritten from Discord each login.
-            SET username = CASE WHEN users.password_hash IS NULL
-                                THEN EXCLUDED.username ELSE users.username END,
-                display_name = EXCLUDED.display_name,
-                avatar = EXCLUDED.avatar,
-                -- A stored tier is never lowered by a later login. Role and
-                -- channel derived access is recomputed per request instead.
-                tier = GREATEST(users.tier, EXCLUDED.tier),
-                last_login_at = now()
-         RETURNING id, discord_id, tier, totp_required, totp_secret_enc, totp_confirmed_at`,
-      [
-        profile.id,
-        profile.username,
-        member.nick ?? profile.global_name ?? null,
-        profile.avatar,
-        TIERS.NONE,
-      ],
-    );
+    const { rows: holder } = await query('SELECT id FROM users WHERE discord_id = $1', [profile.id]);
+    const outcome = resolveCallback({
+      intent: decoded.intent,
+      signedInUserId: req.user?.id ?? null,
+      existingUserId: holder[0]?.id ?? null,
+      isBootstrapAdmin: config.bootstrapAdminIds.includes(profile.id),
+    });
+
+    if (outcome.action === CALLBACK_ACTIONS.LINK) {
+      issuePendingLink(res, outcome.userId, profile.id);
+      return res.redirect(`${LINK_PAGE}?complete=1`);
+    }
+    if (outcome.action === CALLBACK_ACTIONS.LINK_SIGNED_OUT) return fail('link_signed_out');
+    if (outcome.action === CALLBACK_ACTIONS.NO_ACCOUNT) return fail('discord_unlinked');
+
+    const user =
+      outcome.action === CALLBACK_ACTIONS.CREATE_BOOTSTRAP
+        ? await createBootstrapUser(profile, member)
+        : await refreshOnSignIn(outcome.userId, profile, member);
+    // The account was removed between the lookup and the update. Nothing is
+    // recreated here, so this reads as an unlinked Discord account.
+    if (!user) return fail('discord_unlinked');
 
     // Admin accounts under 2FA get a challenge instead of a session; the code
     // page completes the sign-in.
-    if (challengeRequired(rows[0])) {
-      issueChallenge(res, rows[0].id);
+    if (challengeRequired(user)) {
+      issueChallenge(res, user.id);
       return res.redirect('/login?twofactor=1');
     }
 
-    await startSession(res, { id: rows[0].id }, member.roles);
+    await startSession(res, { id: user.id }, member.roles);
     return res.redirect('/');
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * Attaches the Discord identity held in the pending cookie to the caller.
+ *
+ * The cookie only says which verified id belongs to which account; whether the
+ * id is still free is decided here, against the table, so an id claimed in the
+ * meantime comes back as a clean 409 rather than a unique violation.
+ */
+discordAuthRouter.post('/link', requireMember, async (req, res, next) => {
+  try {
+    if (!pluginReady()) {
+      return res.status(409).json({ error: 'The Discord plugin is not connected to a server.' });
+    }
+
+    const pending = readPendingLink(req);
+    res.clearCookie(PENDING_COOKIE, { path: '/' });
+
+    if (!pending) {
+      return res.status(400).json({ error: 'That linking request expired. Start it again.' });
+    }
+    if (pending.userId !== req.user.id) {
+      return res.status(403).json({ error: 'That linking request was for a different account.' });
+    }
+
+    // Membership is re-checked at the moment of attachment, and the member is
+    // where the display name and avatar come from.
+    let member;
+    try {
+      member = await discord.guildMember(pending.discordId);
+    } catch {
+      return res.status(502).json({ error: 'Could not reach Discord to check that account.' });
+    }
+    if (!member) {
+      return res.status(409).json({ error: 'That Discord account is not a member of the server.' });
+    }
+
+    const { rows: holder } = await query('SELECT id FROM users WHERE discord_id = $1', [
+      pending.discordId,
+    ]);
+    const outcome = resolveLink({
+      signedInUserId: req.user.id,
+      ownerUserId: holder[0]?.id ?? null,
+    });
+    if (!outcome.ok) return res.status(outcome.status).json({ error: outcome.error });
+
+    if (outcome.changed) {
+      const profile = member.user ?? {};
+      await query(
+        `UPDATE users
+            SET discord_id = $2,
+                -- A local account already has a name and picture of its own;
+                -- Discord only fills what is missing.
+                display_name = COALESCE(display_name, $3),
+                avatar = COALESCE(avatar, $4)
+          WHERE id = $1`,
+        [
+          req.user.id,
+          pending.discordId,
+          member.nick ?? profile.global_name ?? null,
+          profile.avatar ?? null,
+        ],
+      );
+      await audit(req.user.id, 'discord.link', 'user', req.user.id, {
+        discordId: pending.discordId,
+      });
+    }
+
+    return res.json({ ok: true, discordId: pending.discordId });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * Unlinks the caller's own Discord identity.
+ *
+ * Refused when it would leave the account with no way to sign in at all. The
+ * forced link step applies again on the next request, which is the point: this
+ * is how an admin moves to a different Discord account, not a way out of
+ * holding one. Access that came from a Discord role or channel ends with the
+ * link, since there is no longer a member to resolve it from.
+ */
+discordAuthRouter.post('/unlink', requireMember, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      'SELECT discord_id, password_hash IS NOT NULL AS has_password FROM users WHERE id = $1',
+      [req.user.id],
+    );
+    const account = rows[0];
+    if (!account?.discord_id) {
+      return res.status(404).json({ error: 'No Discord account is linked to this account.' });
+    }
+    if (!canUnlinkDiscord({ hasPassword: account.has_password })) {
+      return res.status(409).json({
+        error: 'Set a username and password first, or unlinking would leave no way to sign in.',
+      });
+    }
+
+    await query('UPDATE users SET discord_id = NULL WHERE id = $1', [req.user.id]);
+    await audit(req.user.id, 'discord.unlink', 'user', req.user.id, {
+      discordId: account.discord_id,
+    });
+    return res.json({ ok: true });
   } catch (error) {
     return next(error);
   }
@@ -406,6 +687,40 @@ discordAdminRouter.post('/admins', requireAdmin, async (req, res, next) => {
       method: 'discord',
     });
     return res.status(201).json({ ok: true, username: rows[0].username });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * Unlinks another account's Discord identity.
+ *
+ * Same refusal as unlinking your own: an account holding neither a password nor
+ * a Discord id could not sign in at all, and no admin action should be able to
+ * produce one. The account is asked to link again on its next request.
+ */
+discordAdminRouter.delete('/link/:userId', requireAdmin, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT id, username, discord_id, password_hash IS NOT NULL AS has_password
+         FROM users WHERE id = $1`,
+      [req.params.userId],
+    );
+    const target = rows[0];
+    if (!target?.discord_id) {
+      return res.status(404).json({ error: 'That account has no linked Discord identity.' });
+    }
+    if (!canUnlinkDiscord({ hasPassword: target.has_password })) {
+      return res.status(409).json({
+        error: 'That account has no password, so unlinking would leave it no way to sign in.',
+      });
+    }
+
+    await query('UPDATE users SET discord_id = NULL WHERE id = $1', [target.id]);
+    await audit(req.user.id, 'discord.unlink', 'user', target.id, {
+      discordId: target.discord_id,
+    });
+    return res.json({ ok: true, username: target.username });
   } catch (error) {
     return next(error);
   }

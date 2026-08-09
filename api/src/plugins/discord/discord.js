@@ -56,17 +56,24 @@ const bot = (path, options = {}) =>
 /**
  * Builds the Discord authorization URL a member is redirected to at login.
  *
+ * Signing in skips the consent screen once it has been given, which is what
+ * makes returning feel like a session rather than a form. Linking asks for it
+ * every time instead: attaching an identity to an account is worth seeing
+ * which Discord account is about to be attached, and the consent screen is
+ * where Discord offers to switch it.
+ *
  * @param {string} state Opaque CSRF token echoed back on the callback.
+ * @param {'none'|'consent'} [prompt] Whether Discord may skip the consent screen.
  * @returns {string} Fully qualified authorization URL.
  */
-export function authorizeUrl(state) {
+export function authorizeUrl(state, prompt = 'none') {
   const params = new URLSearchParams({
     client_id: requireDiscord().clientId,
     redirect_uri: config.discord.redirectUri,
     response_type: 'code',
     scope: 'identify',
     state,
-    prompt: 'none',
+    prompt,
   });
   return `${API}/oauth2/authorize?${params}`;
 }
