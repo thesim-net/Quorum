@@ -1,17 +1,24 @@
 import { Router } from 'express';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { config } from '../../config.js';
-import { query } from '../../db/pool.js';
+import { query, transaction } from '../../db/pool.js';
 import { mask } from '../../lib/secretbox.js';
 import { canUnlinkDiscord } from '../../lib/onboarding.js';
 import { current, effectiveAuthMethods } from '../../lib/settings.js';
 import { PLUGINS, isPluginEnabled } from '../../lib/plugins.js';
-import { PERMISSIONS, TIERS, sanitisePermissions } from '../../lib/permissionSet.js';
+import { PERMISSIONS, TIERS } from '../../lib/permissionSet.js';
+import {
+  mayGrantTier,
+  requestedGroupId,
+  requestedStanding,
+  resolveInviteGroup,
+} from '../../lib/adminAccounts.js';
+import { loadGroupContext, requireAnyGroupPermission } from '../../lib/groups.js';
 import {
   newStateToken,
   requireAdmin,
+  requireGroupAdmin,
   requireMember,
-  requirePermission,
   startSession,
 } from '../../middleware/session.js';
 import { issueRespondentDiscord } from '../../middleware/respondent.js';
@@ -663,10 +670,16 @@ discordAdminRouter.post('/settings/reset', requireAdmin, async (req, res, next) 
   }
 });
 
-/** Lists the guild's roles and text channels so gates can be configured. */
+/**
+ * Lists the guild's roles and text channels so gates can be configured.
+ *
+ * Serves no particular survey, so it is authorised against the caller's groups
+ * as a whole: anybody who can write a survey somewhere needs to see the lists
+ * they would gate it on.
+ */
 discordAdminRouter.get(
   '/guild',
-  requirePermission(PERMISSIONS.SURVEYS_WRITE),
+  requireAnyGroupPermission(PERMISSIONS.SURVEYS_WRITE),
   async (req, res, next) => {
     try {
       if (!pluginReady()) {
@@ -697,10 +710,14 @@ discordAdminRouter.get(
 /**
  * Grants admin access to a Discord user id.
  *
- * The id is checked against the guild first, so a typo cannot silently create
- * an admin account for somebody who is not in the server.
+ * The same account as a local one, and the same rules: a tier, the group it
+ * starts in, and whether that membership administers the group. A group
+ * administrator invites into the group they administer and no other, settled
+ * server-side rather than taken from the form. The id is checked against the
+ * guild first, so a typo cannot silently create an admin account for somebody
+ * who is not in the server.
  */
-discordAdminRouter.post('/admins', requireAdmin, async (req, res, next) => {
+discordAdminRouter.post('/admins', requireGroupAdmin, async (req, res, next) => {
   try {
     if (!pluginReady()) {
       return res.status(409).json({ error: 'The Discord plugin is not connected to a server.' });
@@ -721,42 +738,77 @@ discordAdminRouter.post('/admins', requireAdmin, async (req, res, next) => {
       return res.status(404).json({ error: 'That user is not a member of the server.' });
     }
 
-    // A super admin holds everything; a plain admin holds only what was
-    // ticked. Granting nothing is refused, so the list never shows someone who
-    // cannot actually do anything.
-    const superAdmin = req.body?.superAdmin === true;
-    const permissions = superAdmin ? [] : sanitisePermissions(req.body?.permissions);
-    if (!superAdmin && permissions.length === 0) {
-      return res.status(400).json({ error: 'Choose at least one permission.' });
+    const standing = requestedStanding(req.body);
+    if (standing.error) return res.status(400).json({ error: standing.error });
+    if (!mayGrantTier(req.user, standing.tier)) {
+      return res
+        .status(403)
+        .json({ error: 'Only a super administrator can create another super administrator.' });
+    }
+
+    const membership = req.user.isSuperAdmin
+      ? []
+      : (await loadGroupContext(req.user.id)).membership;
+    const target = resolveInviteGroup(req.user, membership, requestedGroupId(req.body));
+    if (target.error) return res.status(target.status).json({ error: target.error });
+
+    if (standing.groupAdmin && !target.groupId) {
+      return res.status(400).json({ error: 'Choose the group they will administer.' });
+    }
+
+    if (target.groupId) {
+      const { rows: group } = await query('SELECT id FROM groups WHERE id = $1', [target.groupId]);
+      if (group.length === 0) return res.status(404).json({ error: 'That group does not exist.' });
+    }
+
+    // Granting an id that already has an account rewrites its tier, so a group
+    // administrator re-granting a super admin would demote them. Their reach
+    // stops at their own group's membership, so it stops here too.
+    if (!req.user.isSuperAdmin) {
+      const { rows: held } = await query('SELECT tier FROM users WHERE discord_id = $1', [
+        discordId,
+      ]);
+      if (held[0]?.tier === TIERS.SUPER) {
+        return res.status(403).json({ error: 'That account is not yours to change.' });
+      }
     }
 
     const profile = member.user ?? {};
-    const { rows } = await query(
-      `INSERT INTO users (discord_id, username, display_name, avatar, tier, permissions)
-            VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (discord_id) DO UPDATE
-            SET tier = EXCLUDED.tier,
-                permissions = EXCLUDED.permissions,
-                username = COALESCE(EXCLUDED.username, users.username),
-                display_name = COALESCE(EXCLUDED.display_name, users.display_name)
-         RETURNING id, username`,
-      [
-        discordId,
-        profile.username ?? `user-${discordId.slice(-4)}`,
-        member.nick ?? profile.global_name ?? null,
-        profile.avatar ?? null,
-        superAdmin ? TIERS.SUPER : TIERS.ADMIN,
-        permissions,
-      ],
-    );
+    const granted = await transaction(async (client) => {
+      const { rows } = await client.query(
+        `INSERT INTO users (discord_id, username, display_name, avatar, tier)
+              VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (discord_id) DO UPDATE
+              SET tier = EXCLUDED.tier,
+                  username = COALESCE(EXCLUDED.username, users.username),
+                  display_name = COALESCE(EXCLUDED.display_name, users.display_name)
+           RETURNING id, username`,
+        [
+          discordId,
+          profile.username ?? `user-${discordId.slice(-4)}`,
+          member.nick ?? profile.global_name ?? null,
+          profile.avatar ?? null,
+          standing.tier,
+        ],
+      );
+      if (target.groupId) {
+        await client.query(
+          `INSERT INTO group_members (group_id, user_id, is_admin) VALUES ($1, $2, $3)
+           ON CONFLICT (group_id, user_id) DO UPDATE SET is_admin = EXCLUDED.is_admin`,
+          [target.groupId, rows[0].id, standing.groupAdmin],
+        );
+      }
+      return rows[0];
+    });
 
-    await audit(req.user.id, 'admin.grant', 'user', rows[0].id, {
+    await audit(req.user.id, 'admin.grant', 'user', granted.id, {
       discordId,
-      superAdmin,
-      permissions,
+      tier: standing.tier,
+      groupId: target.groupId,
+      groupAdmin: standing.groupAdmin,
       method: 'discord',
     });
-    return res.status(201).json({ ok: true, username: rows[0].username });
+    return res.status(201).json({ ok: true, username: granted.username });
   } catch (error) {
     return next(error);
   }

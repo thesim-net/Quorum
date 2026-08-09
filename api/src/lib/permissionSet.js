@@ -1,10 +1,12 @@
 /**
- * Access tiers and admin permissions.
+ * Access tiers and the permissions groups hand out.
  *
  * A super admin is unrestricted: every permission, managing other admins, and
- * re-running setup. A plain admin holds only what was granted, and cannot see
- * super admins at all - so the people who run the deployment are not
- * enumerable by the people who merely help run surveys.
+ * re-running setup. A plain admin holds nothing of their own - what they may do
+ * comes from the groups they belong to, resolved per survey in
+ * groupPermissions.js. A plain admin cannot see super admins at all, so the
+ * people who run the deployment are not enumerable by the people who merely
+ * help run surveys.
  */
 
 export const TIERS = {
@@ -64,32 +66,6 @@ export const PERMISSION_LABELS = {
       'See charts, metrics, and downloads. Includes respondent usernames on surveys that record them.',
   },
 };
-
-/**
- * Resolves the permissions a user effectively holds.
- *
- * @param {{tier?: string, permissions?: string[]}} user
- * @returns {string[]} Every permission the user can exercise.
- */
-export function effectivePermissions(user) {
-  if (isSuper(user)) return [...ALL_PERMISSIONS];
-  if (user?.tier !== TIERS.ADMIN) return [];
-  return (user.permissions ?? []).filter((p) => ALL_PERMISSIONS.includes(p));
-}
-
-/**
- * Whether a user holds a permission.
- *
- * @param {{tier?: string, permissions?: string[]}} user
- * @param {string} permission One of PERMISSIONS.
- * @returns {boolean} True when the user may perform the action.
- */
-export function can(user, permission) {
-  if (!user) return false;
-  if (isSuper(user)) return true;
-  if (user.tier !== TIERS.ADMIN) return false;
-  return (user.permissions ?? []).includes(permission);
-}
 
 /**
  * Filters a submitted permission list down to known values.

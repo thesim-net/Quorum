@@ -3,7 +3,7 @@ import { config } from '../config.js';
 import { query } from '../db/pool.js';
 import { current } from '../lib/settings.js';
 import { PLUGINS, isPluginEnabled } from '../lib/plugins.js';
-import { can, effectivePermissions, isSuper, TIERS } from '../lib/permissionSet.js';
+import { isSuper, TIERS } from '../lib/permissionSet.js';
 import { discordTier, refreshSessionRoles } from '../plugins/discord/session.js';
 
 const COOKIE = 'quorum_sid';
@@ -118,8 +118,16 @@ export function loadSession() {
       const { rows } = await query(
         `SELECT s.id, s.role_ids, s.roles_synced_at, s.expires_at,
                 u.id AS user_id, u.discord_id, u.username, u.display_name, u.avatar,
-                u.tier, u.permissions, u.prefs,
-                u.password_hash IS NOT NULL AS has_password
+                u.tier, u.prefs,
+                u.password_hash IS NOT NULL AS has_password,
+                -- The coarse "do they administer any group at all", for showing
+                -- the Groups tab and for letting an invite through the door.
+                -- WHICH group is a different question, always answered against
+                -- the group being acted on rather than from here.
+                EXISTS (
+                  SELECT 1 FROM group_members gm
+                   WHERE gm.user_id = u.id AND gm.is_admin
+                ) AS administers_a_group
            FROM sessions s
            JOIN users u ON u.id = s.user_id
           WHERE s.id = $1 AND s.expires_at > now()`,
@@ -168,7 +176,12 @@ export function loadSession() {
         isSuperAdmin: isSuper({ tier }),
         // Retained for readability at call sites: "can reach the panel".
         isAdmin: tier !== TIERS.NONE,
-        permissions: effectivePermissions({ tier, permissions: session.permissions }),
+        // True when at least one of their memberships administers its group.
+        // Never a licence over a particular group - see requireGroupControl.
+        administersAGroup: Boolean(session.administers_a_group),
+        // No permission list here on purpose. What a plain admin may do depends
+        // on which group owns the thing they are touching, so it is resolved
+        // per request in lib/groups.js rather than carried on the session.
         prefs: session.prefs ?? {},
       };
     } catch (error) {
@@ -206,10 +219,29 @@ export function requireAdmin(req, res, next) {
 }
 
 /**
+ * Rejects the request unless the caller administers a group, or everything.
+ *
+ * The coarse half of the check: it opens the door to the routes that manage
+ * people and memberships. Which group they may actually act on is settled
+ * inside those routes, against the group named by the request, because
+ * administering one group says nothing about any other.
+ *
+ * @type {import('express').RequestHandler}
+ */
+export function requireGroupAdmin(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: 'Sign in to continue.' });
+  if (!req.user.isSuperAdmin && !req.user.administersAGroup) {
+    return res.status(403).json({ error: 'You do not administer any group.' });
+  }
+  return next();
+}
+
+/**
  * Rejects the request unless the caller can reach the admin panel at all.
  *
- * A limited admin holds at least one permission; what they may actually do is
- * enforced per route by `requirePermission`.
+ * Reaching the panel is not permission to do anything in it: what a plain admin
+ * may actually do is enforced per route by `requireSurveyPermission`, against
+ * the group that owns the survey in question.
  *
  * @type {import('express').RequestHandler}
  */
@@ -219,25 +251,6 @@ export function requirePanel(req, res, next) {
     return res.status(403).json({ error: 'Admin access required.' });
   }
   return next();
-}
-
-/**
- * Builds middleware that requires one specific permission.
- *
- * @param {string} permission One of PERMISSIONS.
- * @returns {import('express').RequestHandler} Express middleware.
- */
-export function requirePermission(permission) {
-  return (req, res, next) => {
-    if (!req.user) return res.status(401).json({ error: 'Sign in to continue.' });
-    if (!can(req.user, permission)) {
-      return res.status(403).json({
-        error: 'You do not have permission to do that.',
-        required: permission,
-      });
-    }
-    return next();
-  };
 }
 
 /**

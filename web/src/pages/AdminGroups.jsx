@@ -59,9 +59,11 @@ function GroupList({ groups, selectedId, onSelect }) {
  * rather than carrying a half-typed rename across.
  *
  * @param {{group: object, admins: object[], catalogue: object[], busy: boolean,
+ *   canManageGroups: boolean,
  *   onRename: (name: string) => void, onMakeDefault: () => void,
  *   onDelete: () => void, onTogglePermission: (key: string) => void,
- *   onAddMember: (userId: string) => Promise<void>,
+ *   onAddMember: (userId: string, isAdmin: boolean) => Promise<void>,
+ *   onSetMemberAdmin: (member: object, isAdmin: boolean) => void,
  *   onRemoveMember: (member: object) => void}} props
  * @returns {JSX.Element} The detail pane.
  */
@@ -70,16 +72,22 @@ function GroupDetail({
   admins,
   catalogue,
   busy,
+  canManageGroups,
   onRename,
   onMakeDefault,
   onDelete,
   onTogglePermission,
   onAddMember,
+  onSetMemberAdmin,
   onRemoveMember,
 }) {
   const [name, setName] = useState(group.name);
   const [memberId, setMemberId] = useState('');
+  const [memberIsAdmin, setMemberIsAdmin] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  // Taking somebody's access away is destructive, so it is confirmed in place
+  // rather than done on a single click, the same as deleting the group.
+  const [removing, setRemoving] = useState(null);
 
   const memberIds = new Set(group.members.map((member) => member.id));
   const assignable = admins.filter((admin) => !memberIds.has(admin.id));
@@ -93,45 +101,53 @@ function GroupDetail({
         </h3>
         {group.isDefault ? <span className="badge">Default</span> : null}
         <span style={{ marginLeft: 'auto' }} />
-        {group.isDefault ? null : (
+        {canManageGroups && !group.isDefault ? (
           <button type="button" onClick={onMakeDefault} disabled={busy}>
             Make default
           </button>
-        )}
-        {group.isDefault ? null : (
+        ) : null}
+        {canManageGroups && !group.isDefault ? (
           <button type="button" className="danger" onClick={() => setConfirming(true)}>
             Delete
           </button>
-        )}
+        ) : null}
       </div>
 
-      <label htmlFor="group-name" style={{ marginTop: '0.75rem', marginBottom: '0.25rem' }}>
-        <span className="field-label">Name</span>
-      </label>
-      <div className="row">
-        <input
-          id="group-name"
-          type="text"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && renamed && onRename(name.trim())}
-          style={{ flex: 1 }}
-        />
-        <button type="button" onClick={() => onRename(name.trim())} disabled={busy || !renamed}>
-          Save name
-        </button>
-      </div>
+      {/* Renaming a group, and deciding what its members may do, shapes the
+          deployment; an administrator of the group runs its membership and
+          reads the rest. The server enforces the same split. */}
+      {canManageGroups ? (
+        <>
+          <label htmlFor="group-name" style={{ marginTop: '0.75rem', marginBottom: '0.25rem' }}>
+            <span className="field-label">Name</span>
+          </label>
+          <div className="row">
+            <input
+              id="group-name"
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && renamed && onRename(name.trim())}
+              style={{ flex: 1 }}
+            />
+            <button type="button" onClick={() => onRename(name.trim())} disabled={busy || !renamed}>
+              Save name
+            </button>
+          </div>
+        </>
+      ) : null}
 
       <h4>Members can</h4>
       <p className="muted" style={{ fontSize: '0.82rem', marginTop: 0 }}>
         Applies to surveys this group owns.
+        {canManageGroups ? '' : ' Only a super administrator can change this.'}
       </p>
       {catalogue.map((entry) => (
         <label className="option-row" key={entry.key}>
           <input
             type="checkbox"
             checked={group.memberPermissions.includes(entry.key)}
-            disabled={busy}
+            disabled={busy || !canManageGroups}
             onChange={() => onTogglePermission(entry.key)}
           />
           <span>
@@ -161,11 +177,31 @@ function GroupDetail({
                       Super administrator
                     </span>
                   ) : null}
+                  {member.administers ? (
+                    <span className="badge" style={{ marginLeft: '0.5rem' }}>
+                      Administers this group
+                    </span>
+                  ) : null}
                 </th>
-                <td style={{ textAlign: 'right' }}>
+                <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                  {/* Administering is a property of THIS membership: it says
+                      nothing about any other group they belong to. A super
+                      admin bypasses groups, so it is never offered for them. */}
+                  {member.tier === 'super_admin' ? null : (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => onSetMemberAdmin(member, !member.administers)}
+                        disabled={busy}
+                      >
+                        {member.administers ? 'Remove as admin' : 'Make group admin'}
+                      </button>{' '}
+                    </>
+                  )}
                   <button
                     type="button"
-                    onClick={() => onRemoveMember(member)}
+                    className="danger"
+                    onClick={() => setRemoving(member)}
                     disabled={busy}
                     aria-label={`Remove ${member.displayName || member.username} from ${group.name}`}
                   >
@@ -200,18 +236,68 @@ function GroupDetail({
           type="button"
           disabled={busy || !memberId}
           onClick={async () => {
-            await onAddMember(memberId);
+            await onAddMember(memberId, memberIsAdmin);
             setMemberId('');
+            setMemberIsAdmin(false);
           }}
         >
           Add
         </button>
       </div>
+      <label className="option-row">
+        <input
+          type="checkbox"
+          checked={memberIsAdmin}
+          disabled={busy}
+          onChange={(e) => setMemberIsAdmin(e.target.checked)}
+        />
+        <span>
+          As an administrator of {group.name}
+          <br />
+          <span className="muted" style={{ fontSize: '0.8rem' }}>
+            They run this group&rsquo;s membership: who is in it, and who else administers it. Only
+            a super administrator can make somebody an administrator of more than one group.
+          </span>
+        </span>
+      </label>
       {group.members.some((member) => member.tier === 'super_admin') ? (
         <p className="muted" style={{ fontSize: '0.8rem' }}>
           Super administrators already have every permission everywhere; membership does not change
           what they can do.
         </p>
+      ) : null}
+
+      {removing ? (
+        <div className="confirm">
+          <h3>Remove {removing.displayName || removing.username} from {group.name}?</h3>
+          <ul>
+            <li>They lose whatever {group.name} lets its members do to its surveys.</li>
+            {removing.administers ? (
+              <li>They no longer administer {group.name} or run its membership.</li>
+            ) : null}
+            <li>
+              Their account is kept, along with every other group they are in. This removes the
+              membership only.
+            </li>
+          </ul>
+          <div className="row">
+            {/* Cancel first and confirm last, so the destructive control is
+                neither the nearest nor the one focus lands on. */}
+            <button type="button" onClick={() => setRemoving(null)}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="danger"
+              onClick={() => {
+                onRemoveMember(removing);
+                setRemoving(null);
+              }}
+            >
+              Remove {removing.displayName || removing.username}
+            </button>
+          </div>
+        </div>
       ) : null}
 
       {confirming ? (
@@ -286,11 +372,17 @@ function GrantList({ rows, catalogue, busy, onEdit, onRemove }) {
 }
 
 /**
- * Group management, super admins only.
+ * Group management.
  *
  * A group decides what its members may do to its own surveys, and can be given
  * permissions over another group's surveys. The default group is renamable but
  * cannot be deleted, and there is always exactly one.
+ *
+ * Two audiences. A super admin shapes the groups themselves: creating them,
+ * renaming them, deciding what their members may do, and granting one group
+ * access to another. An administrator of a group runs that group's membership
+ * and only that: the server sends them their own groups alone, and everything
+ * outside membership is read-only here as well as refused there.
  *
  * The page is two sections, each reading left to right. The first picks one
  * group and shows only that group's controls; the second is a single sentence
@@ -352,6 +444,7 @@ export function AdminGroups() {
   }
 
   const { groups, admins, catalogue } = data;
+  const canManageGroups = Boolean(data.canManageGroups);
   // The selection is derived rather than stored, so deleting the selected group
   // falls back to the default instead of leaving the pane pointing at nothing.
   const selected =
@@ -399,13 +492,35 @@ export function AdminGroups() {
     );
 
   /**
-   * Adds an admin to the selected group.
+   * Adds an admin to the selected group, optionally to administer it.
    *
    * @param {string} userId The admin to add.
+   * @param {boolean} isAdmin Whether the new membership administers the group.
    */
-  const addMember = (userId) =>
+  const addMember = (userId, isAdmin) =>
     run(() =>
-      api(`/admin/groups/${selected.id}/members`, { method: 'POST', body: { userId } }),
+      api(`/admin/groups/${selected.id}/members`, { method: 'POST', body: { userId, isAdmin } }),
+    );
+
+  /**
+   * Grants or revokes administration of the selected group to one member.
+   *
+   * Scoped to this group alone: it says nothing about any other group they
+   * belong to, and the server refuses a caller who does not administer this one.
+   *
+   * @param {object} member The member being changed.
+   * @param {boolean} isAdmin The standing to set.
+   */
+  const setMemberAdmin = (member, isAdmin) =>
+    run(
+      () =>
+        api(`/admin/groups/${selected.id}/members/${member.id}`, {
+          method: 'PATCH',
+          body: { isAdmin },
+        }),
+      isAdmin
+        ? `${member.displayName || member.username} now administers ${selected.name}.`
+        : `${member.displayName || member.username} no longer administers ${selected.name}.`,
     );
 
   /**
@@ -414,8 +529,9 @@ export function AdminGroups() {
    * @param {object} member The member to remove.
    */
   const removeMember = (member) =>
-    run(() =>
-      api(`/admin/groups/${selected.id}/members/${member.id}`, { method: 'DELETE' }),
+    run(
+      () => api(`/admin/groups/${selected.id}/members/${member.id}`, { method: 'DELETE' }),
+      `${member.displayName || member.username} is no longer in ${selected.name}.`,
     );
 
   /** Deletes the selected group, reassigning its surveys to the default. */
@@ -501,6 +617,9 @@ export function AdminGroups() {
         A group decides what its members can do to its own surveys, and can be granted access to
         another group&rsquo;s surveys. Membership is explicit and works the same with or without
         Discord.
+        {canManageGroups
+          ? ''
+          : ' You are shown the groups you administer: their membership is yours to run, and the rest is a super administrator’s.'}
       </p>
 
       {error ? <div className="error">{error}</div> : null}
@@ -515,20 +634,22 @@ export function AdminGroups() {
         <div className="split">
           <div className="split-side">
             <GroupList groups={groups} selectedId={selected?.id} onSelect={setSelectedId} />
-            <div className="row" style={{ marginTop: '0.75rem' }}>
-              <input
-                type="text"
-                aria-label="New group name"
-                placeholder="New group name"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && name.trim() && create()}
-                style={{ flex: 1, minWidth: '8rem' }}
-              />
-              <button type="button" className="primary" onClick={create} disabled={busy || !name.trim()}>
-                Create
-              </button>
-            </div>
+            {canManageGroups ? (
+              <div className="row" style={{ marginTop: '0.75rem' }}>
+                <input
+                  type="text"
+                  aria-label="New group name"
+                  placeholder="New group name"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && name.trim() && create()}
+                  style={{ flex: 1, minWidth: '8rem' }}
+                />
+                <button type="button" className="primary" onClick={create} disabled={busy || !name.trim()}>
+                  Create
+                </button>
+              </div>
+            ) : null}
           </div>
 
           {selected ? (
@@ -538,19 +659,29 @@ export function AdminGroups() {
               admins={admins}
               catalogue={catalogue}
               busy={busy}
+              canManageGroups={canManageGroups}
               onRename={rename}
               onMakeDefault={makeDefault}
               onDelete={destroy}
               onTogglePermission={toggleMemberPermission}
               onAddMember={addMember}
+              onSetMemberAdmin={setMemberAdmin}
               onRemoveMember={removeMember}
             />
           ) : (
-            <p className="empty split-main">Create a group to get started.</p>
+            <p className="empty split-main">
+              {canManageGroups
+                ? 'Create a group to get started.'
+                : 'You do not administer a group yet.'}
+            </p>
           )}
         </div>
       </div>
 
+      {/* Reaching across groups is a deployment-shaping decision, so the whole
+          section belongs to super admins. An administrator of one group has no
+          business granting it rights over another. */}
+      {!canManageGroups ? null : (
       <div className="card">
         <h2>Access between groups</h2>
         <p className="muted" style={{ fontSize: '0.85rem' }}>
@@ -657,6 +788,7 @@ export function AdminGroups() {
           </>
         )}
       </div>
+      )}
     </div>
   );
 }

@@ -11,7 +11,7 @@ Created by [Thomas Loupe](https://thomasloupe.com).
 - **Eight question types:** short and long text (with character limits), integer (min/max/step), single choice, multiple choice (with selection limits), ranking, true/false (with custom labels), scale, and file upload.
 - **Privacy by design:** responses are pseudonymous by default, IP addresses are never stored, and every collection toggle is disclosed to the participant before they answer.
 - **Results dashboards** with per-question charts (donuts and bars), a table view for every chart, colour-vision-safe palettes, and CSV/JSON export.
-- **Admin panel** to create, schedule, open, close, and delete surveys, manage admins with granular permissions, and connect Discord through a guided wizard.
+- **Admin panel** to create, schedule, open, close, and delete surveys, manage admins and the groups that decide what they can do, and connect Discord through a guided wizard.
 - **Optional plugins:** Discord integration, two-factor authentication, Discord announcements, closing reminders, conditional question logic, response quotas, and a raffle picker.
 - **Four skins** (Default, GitHub, Obsidian, High Contrast) in light and dark, remembered per account.
 - **A public data-privacy page** that spells out exactly what a deployment can collect, why, and when it is anonymised.
@@ -61,10 +61,14 @@ A pass proves the image was built by this repo's release workflow from that comm
 
 Two tiers:
 
-- **Super administrator:** unrestricted. Manages other admins, promotes further super admins, and configures sign-in and plugins. The first one is created by the one-time setup link.
-- **Administrator:** only the permissions granted: create/edit surveys, open/close surveys, delete surveys, and view results/export.
+- **Super administrator:** unrestricted. Manages other admins, promotes further super admins, and configures sign-in and plugins. Bypasses groups entirely. The first one is created by the one-time setup link.
+- **Administrator:** whatever their groups allow, and nothing of their own.
 
-Admins are local accounts (created with a one-time password shown once), or Discord members granted by user id when that plugin is connected. A plain administrator never sees that super administrators exist. Admins can also be granted by a Discord role or channel chosen in the Discord plugin settings; those grant the administrator tier, never super administrator. You cannot remove your own access, and the last super administrator cannot be removed.
+**Groups are where permissions live.** Every survey is owned by a group, and a group says what its members may do to its own surveys: create/edit, open/close, delete, and view results/export. A group can also be granted some of those over another group's surveys. An administrator in no group is treated as a member of the default group, which always exists and cannot be deleted, so an account is never stranded. All of it is edited on the Groups page; an account itself holds only its tier and its membership.
+
+**Group administrators** run one group's membership. The standing belongs to the membership, not to the account: an administrator of Selections who also belongs to Astro administers Selections and nothing else. Within a group they administer they can invite somebody into it, add an existing admin to it, make another member an administrator of that same group, and remove a member from it — the membership only, never the account. They cannot create, rename or delete groups, change what any group's members may do, grant one group access to another, reach plugins or deployment settings, or make anybody a super administrator. Only a super administrator can make somebody an administrator of more than one group. Super administrator and group administrator are exclusive: a super admin bypasses groups, so the one excludes the other in both directions.
+
+Admins are local accounts (created with a one-time password shown once), or Discord members granted by user id when that plugin is connected. Either can be put in a group as they are created, and marked as an administrator of it at the same time, which is the same thing the Groups page does. A plain administrator never sees that super administrators exist. Admins can also be granted by a Discord role or channel chosen in the Discord plugin settings; those grant the administrator tier, never super administrator. You cannot remove your own access, and the last super administrator cannot be removed.
 
 **One person is one account.** Where the Discord plugin is connected, an admin holds both identities: a local username and password, and a linked Discord id. Both are asked for once, as a single "finish setting up your account" flow with a fixed order, and a step already satisfied is skipped. Signing in with a Discord account nobody has linked creates nothing; it says so and points at the sign-in form, because accounts exist for administrators and respondents need none. Linking runs over the same OAuth redirect URL as signing in, and a Discord id already held by another account is refused rather than moved. Anyone can unlink their own Discord from Settings, and a super admin can unlink somebody else's from the Users tab, except where that would leave an account with no way to sign in at all.
 
@@ -101,7 +105,7 @@ web/            React SPA
 cd api && npm test
 ```
 
-Covers Discord permission resolution, Discord account linking and the OAuth intent it is carried by, the forced-onboarding order, answer validation, response timing, result aggregation, file-upload validation, password hashing, and TOTP (against the RFC 4226/6238 vectors).
+Covers group permission resolution, what an admin account may consist of and who may change one, what removing an admin costs, Discord permission resolution, Discord account linking and the OAuth intent it is carried by, the forced-onboarding order, answer validation, response timing, result aggregation, file-upload validation, password hashing, and TOTP (against the RFC 4226/6238 vectors).
 
 ## Notes
 

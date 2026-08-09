@@ -25,14 +25,21 @@ import {
   sanitisePlugins,
 } from '../lib/plugins.js';
 import { updateStatus } from '../lib/update.js';
-import { requireAdmin, requirePanel } from '../middleware/session.js';
+import { requireAdmin, requireGroupAdmin, requirePanel } from '../middleware/session.js';
 import {
   ALL_PERMISSIONS,
   PERMISSIONS,
   PERMISSION_LABELS,
   TIERS,
-  sanitisePermissions,
 } from '../lib/permissionSet.js';
+import {
+  administeredGroupIds,
+  mayGrantTier,
+  requestedGroupId,
+  requestedStanding,
+  resolveInviteGroup,
+  stripsLastSuperAdmin,
+} from '../lib/adminAccounts.js';
 import {
   accessibleGroupIds,
   effectivePermissionsForGroup,
@@ -40,6 +47,7 @@ import {
   membershipWithFallback,
   requireSurveyPermission,
   resolveCreateGroup,
+  userPermissionUnion,
 } from '../lib/groups.js';
 import { groupsRouter } from './groups.js';
 import { postMessage } from '../plugins/discord/discord.js';
@@ -48,8 +56,8 @@ import { adminDirectory, hasBootstrapSupers } from '../plugins/discord/session.j
 
 export const adminRouter = Router();
 
-// Reaching the panel needs at least one permission; each route then requires
-// the specific one it needs.
+// Reaching the panel is one thing; doing anything in it is another, and each
+// route below requires the specific permission it needs.
 adminRouter.use(requirePanel);
 
 // Group management is its own concern, super-admin gated inside the sub-router.
@@ -82,14 +90,29 @@ adminRouter.get('/update', requireAdmin, async (req, res, next) => {
   }
 });
 
-/** Reports the caller's own permissions, so the UI can hide what they cannot do. */
-adminRouter.get('/me', (req, res) => {
-  res.json({
-    tier: req.user.tier,
-    isSuperAdmin: req.user.isSuperAdmin,
-    permissions: req.user.permissions,
-    catalogue: ALL_PERMISSIONS.map((key) => ({ key, ...PERMISSION_LABELS[key] })),
-  });
+/**
+ * Reports who the caller is and, roughly, what they can do.
+ *
+ * `permissions` is the union of what the caller holds across every group they
+ * can act in - their own groups' member permissions plus any cross-group
+ * grants. It exists so the client can leave out buttons for things this person
+ * can never do anywhere; it is advisory UI hinting and NEVER an authorisation
+ * decision. Holding surveys.delete here says only that some group lets them
+ * delete something, not that they may delete any particular survey: that is
+ * settled per survey, server-side, by `requireSurveyPermission`.
+ */
+adminRouter.get('/me', async (req, res, next) => {
+  try {
+    const permissions = await userPermissionUnion(req.user);
+    res.json({
+      tier: req.user.tier,
+      isSuperAdmin: req.user.isSuperAdmin,
+      permissions: [...permissions],
+      catalogue: ALL_PERMISSIONS.map((key) => ({ key, ...PERMISSION_LABELS[key] })),
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 const QUESTION_TYPES = new Set([
@@ -450,7 +473,10 @@ adminRouter.put('/ascii-animation', requireAdmin, async (req, res, next) => {
  * Lists everyone who can reach the admin panel.
  *
  * Admins arrive three ways and only one of them is revocable here, so each
- * entry declares its source rather than implying they are all the same.
+ * entry declares its source rather than implying they are all the same. What an
+ * entry may do is not listed per account, because it is not held per account:
+ * each one carries the groups it belongs to, marking the ones it administers,
+ * and the groups say what those mean.
  */
 adminRouter.get('/admins', async (req, res, next) => {
   try {
@@ -459,14 +485,41 @@ adminRouter.get('/admins', async (req, res, next) => {
       ? [TIERS.ADMIN, TIERS.SUPER]
       : [TIERS.ADMIN];
 
-    const { rows } = await query(
-      `SELECT id, discord_id, username, display_name, avatar, last_login_at,
-              tier, permissions, totp_required, totp_confirmed_at,
-              password_hash IS NOT NULL AS local
-         FROM users
-        WHERE tier = ANY($1::admin_tier[])
-        ORDER BY tier DESC, username`,
-      [visibleTiers],
+    const [{ rows }, memberships, allGroups, context] = await Promise.all([
+      query(
+        `SELECT id, discord_id, username, display_name, avatar, last_login_at,
+                tier, totp_required, totp_confirmed_at,
+                password_hash IS NOT NULL AS local
+           FROM users
+          WHERE tier = ANY($1::admin_tier[])
+          ORDER BY tier DESC, username`,
+        [visibleTiers],
+      ),
+      query(
+        `SELECT m.user_id, m.is_admin, g.id, g.name
+           FROM group_members m JOIN groups g ON g.id = m.group_id
+          ORDER BY g.is_default DESC, g.name`,
+      ),
+      query('SELECT id, name, is_default FROM groups ORDER BY is_default DESC, name'),
+      req.user.isSuperAdmin ? Promise.resolve(null) : loadGroupContext(req.user.id),
+    ]);
+
+    const groupsByUser = new Map();
+    for (const row of memberships.rows) {
+      if (!groupsByUser.has(row.user_id)) groupsByUser.set(row.user_id, []);
+      groupsByUser.get(row.user_id).push({
+        id: row.id,
+        name: row.name,
+        administers: row.is_admin,
+      });
+    }
+
+    // Where a new account may be put. A super admin may choose any group, or
+    // none; anybody else invites into a group they administer and no other, so
+    // the client cannot even offer somebody else's group.
+    const administered = context ? administeredGroupIds(context.membership) : null;
+    const inviteGroups = allGroups.rows.filter(
+      (row) => administered === null || administered.has(row.id),
     );
 
     const settings = current();
@@ -485,25 +538,40 @@ adminRouter.get('/admins', async (req, res, next) => {
     }
 
     res.json({
+      // Accounts themselves - promoting, revoking, passwords, 2FA - are a
+      // super admin's business. Inviting somebody into a group you administer
+      // is not, which is why the two are separate answers.
       canManage: req.user.isSuperAdmin,
+      canInvite: req.user.isSuperAdmin || req.user.administersAGroup,
       plugins: {
         discord: discordActive(),
         twofactor: isPluginEnabled(settings.plugins, PLUGINS.TWOFACTOR),
       },
-      granted: rows.map((row) => ({
+      granted: rows.map((row) => {
+        const groups = groupsByUser.get(row.id) ?? [];
+        return {
+          id: row.id,
+          discordId: row.discord_id,
+          username: row.username,
+          displayName: row.display_name,
+          lastLoginAt: row.last_login_at,
+          tier: row.tier,
+          local: row.local,
+          totpRequired: row.totp_required,
+          totpEnrolled: Boolean(row.totp_confirmed_at),
+          groups,
+          // Shown as a group administrator when any one membership says so,
+          // and the interesting part is which - so the groups carry it too.
+          administers: groups.filter((group) => group.administers).map((group) => group.name),
+          isSelf: row.id === req.user.id,
+        };
+      }),
+      // The groups a new account may be placed into, most-default first.
+      groups: inviteGroups.map((row) => ({
         id: row.id,
-        discordId: row.discord_id,
-        username: row.username,
-        displayName: row.display_name,
-        lastLoginAt: row.last_login_at,
-        tier: row.tier,
-        local: row.local,
-        totpRequired: row.totp_required,
-        totpEnrolled: Boolean(row.totp_confirmed_at),
-        permissions: row.tier === TIERS.SUPER ? ALL_PERMISSIONS : row.permissions,
-        isSelf: row.id === req.user.id,
+        name: row.name,
+        isDefault: row.is_default,
       })),
-      catalogue: ALL_PERMISSIONS.map((key) => ({ key, ...PERMISSION_LABELS[key] })),
       // Not revocable from here: these come from configuration, not a grant.
       bootstrapIds,
       adminRoles: roles,
@@ -517,11 +585,23 @@ adminRouter.get('/admins', async (req, res, next) => {
 /**
  * Creates a local admin account.
  *
- * The one-time password comes back exactly once, for the granting admin to
- * hand over; the holder changes it themselves. Granting by Discord id lives on
- * the discord plugin's routes.
+ * An account is a tier and a group, nothing more. A super admin may name any
+ * group or none, because an admin in no group resolves against the default one.
+ * A group administrator invites into the group they administer: the server
+ * settles which group that is rather than trusting the form, so a request
+ * naming somebody else's group is refused instead of quietly obeyed.
+ *
+ * `groupAdmin` makes the membership being created an administrator of that same
+ * group. A group administrator may set it, which is deliberately
+ * self-propagating within one group at the owner's instruction; making somebody
+ * an administrator of a SECOND group stays a super admin's decision, which for
+ * a brand-new account never arises.
+ *
+ * The one-time password comes back exactly once, for the granting admin to hand
+ * over; the holder changes it themselves. Granting by Discord id lives on the
+ * discord plugin's routes and follows the same rules.
  */
-adminRouter.post('/admins', requireAdmin, async (req, res, next) => {
+adminRouter.post('/admins', requireGroupAdmin, async (req, res, next) => {
   try {
     const username = String(req.body?.username ?? '').trim();
     if (!USERNAME_PATTERN.test(username)) {
@@ -530,13 +610,22 @@ adminRouter.post('/admins', requireAdmin, async (req, res, next) => {
       });
     }
 
-    // A super admin holds everything; a plain admin holds only what was
-    // ticked. Granting nothing is refused, so the list never shows someone who
-    // cannot actually do anything.
-    const superAdmin = req.body?.superAdmin === true;
-    const permissions = superAdmin ? [] : sanitisePermissions(req.body?.permissions);
-    if (!superAdmin && permissions.length === 0) {
-      return res.status(400).json({ error: 'Choose at least one permission.' });
+    const standing = requestedStanding(req.body);
+    if (standing.error) return res.status(400).json({ error: standing.error });
+    if (!mayGrantTier(req.user, standing.tier)) {
+      return res
+        .status(403)
+        .json({ error: 'Only a super administrator can create another super administrator.' });
+    }
+
+    const membership = req.user.isSuperAdmin
+      ? []
+      : (await loadGroupContext(req.user.id)).membership;
+    const target = resolveInviteGroup(req.user, membership, requestedGroupId(req.body));
+    if (target.error) return res.status(target.status).json({ error: target.error });
+
+    if (standing.groupAdmin && !target.groupId) {
+      return res.status(400).json({ error: 'Choose the group they will administer.' });
     }
 
     const { rows: existing } = await query(
@@ -547,20 +636,38 @@ adminRouter.post('/admins', requireAdmin, async (req, res, next) => {
       return res.status(409).json({ error: 'That username is already taken.' });
     }
 
-    const password = generatePassword();
-    const { rows } = await query(
-      `INSERT INTO users (username, password_hash, tier, permissions)
-       VALUES ($1, $2, $3, $4) RETURNING id, username`,
-      [username, await hashPassword(password), superAdmin ? TIERS.SUPER : TIERS.ADMIN, permissions],
-    );
+    if (target.groupId) {
+      const { rows: group } = await query('SELECT id FROM groups WHERE id = $1', [target.groupId]);
+      if (group.length === 0) return res.status(404).json({ error: 'That group does not exist.' });
+    }
 
-    await audit(req.user.id, 'admin.grant', 'user', rows[0].id, {
+    const password = generatePassword();
+    // Account and membership are one act: a half-created admin who exists but
+    // is in nobody's group is not what the form asked for.
+    const created = await transaction(async (client) => {
+      const { rows } = await client.query(
+        `INSERT INTO users (username, password_hash, tier)
+         VALUES ($1, $2, $3) RETURNING id, username`,
+        [username, await hashPassword(password), standing.tier],
+      );
+      if (target.groupId) {
+        await client.query(
+          `INSERT INTO group_members (group_id, user_id, is_admin) VALUES ($1, $2, $3)
+           ON CONFLICT DO NOTHING`,
+          [target.groupId, rows[0].id, standing.groupAdmin],
+        );
+      }
+      return rows[0];
+    });
+
+    await audit(req.user.id, 'admin.grant', 'user', created.id, {
       username,
-      superAdmin,
-      permissions,
+      tier: standing.tier,
+      groupId: target.groupId,
+      groupAdmin: standing.groupAdmin,
       method: 'local',
     });
-    return res.status(201).json({ ok: true, username: rows[0].username, password });
+    return res.status(201).json({ ok: true, username: created.username, password });
   } catch (error) {
     return next(error);
   }
@@ -605,30 +712,39 @@ adminRouter.delete('/admins/:userId', requireAdmin, async (req, res, next) => {
       });
     }
 
-    // Only super admins keep the deployment reachable, so the count that
-    // matters is of them - a panel full of plain admins can still be locked
-    // out of setup and admin management.
     const { rows: counts } = await query(
       `SELECT count(*)::int AS n FROM users WHERE tier = 'super_admin'`,
     );
-    const hasOtherSource = discordActive() && hasBootstrapSupers();
 
     const { rows: target } = await query('SELECT tier FROM users WHERE id = $1', [
       req.params.userId,
     ]);
     if (target.length === 0) return res.status(404).json({ error: 'That admin was not found.' });
 
-    if (target[0].tier === TIERS.SUPER && counts[0].n <= 1 && !hasOtherSource) {
+    if (
+      stripsLastSuperAdmin({
+        targetTier: target[0].tier,
+        superAdminCount: counts[0].n,
+        otherSuperSource: discordActive() && hasBootstrapSupers(),
+      })
+    ) {
       return res.status(409).json({
         error: 'This is the only super administrator. Add another one first.',
       });
     }
 
-    const { rowCount } = await query(
-      `UPDATE users SET tier = 'none', permissions = '{}'
-        WHERE id = $1 AND tier <> 'none'`,
-      [req.params.userId],
-    );
+    // Group membership goes with the access it belonged to, or the Groups page
+    // would keep listing somebody who can no longer reach the panel at all.
+    const rowCount = await transaction(async (client) => {
+      const result = await client.query(
+        `UPDATE users SET tier = 'none' WHERE id = $1 AND tier <> 'none'`,
+        [req.params.userId],
+      );
+      if (result.rowCount > 0) {
+        await client.query('DELETE FROM group_members WHERE user_id = $1', [req.params.userId]);
+      }
+      return result.rowCount;
+    });
     if (rowCount === 0) return res.status(404).json({ error: 'That admin was not found.' });
 
     await audit(req.user.id, 'admin.revoke', 'user', req.params.userId, {});
@@ -639,28 +755,48 @@ adminRouter.delete('/admins/:userId', requireAdmin, async (req, res, next) => {
 });
 
 /**
- * Changes what an existing admin may do.
+ * Promotes an admin to super administrator, or demotes one back.
  *
- * Demoting yourself is refused for the same reason revoking yourself is: it is
- * the quickest way to lock the panel and there is no way back from inside it.
+ * The only standing an account holds of its own, and a super admin's decision
+ * alone. Administering a group is not set here: it belongs to a membership, so
+ * it is granted and revoked per group on the Groups page. Changing your own is
+ * refused for the same reason revoking yourself is: it is the quickest way to
+ * lock the panel and there is no way back from inside it.
  */
 adminRouter.patch('/admins/:userId', requireAdmin, async (req, res, next) => {
   try {
     if (req.params.userId === req.user.id) {
       return res
         .status(409)
-        .json({ error: 'You cannot change your own permissions. Ask another admin.' });
+        .json({ error: 'You cannot change your own access. Ask another admin.' });
     }
 
-    const superAdmin = req.body?.superAdmin === true;
-    const permissions = superAdmin ? [] : sanitisePermissions(req.body?.permissions);
-    if (!superAdmin && permissions.length === 0) {
-      return res.status(400).json({ error: 'Choose at least one permission.' });
+    const standing = requestedStanding(req.body);
+    if (standing.error) return res.status(400).json({ error: standing.error });
+    const tier = standing.tier;
+
+    // Super admin and group administrator are exclusive, and a super admin
+    // bypasses groups, so promoting somebody who still administers one is
+    // refused rather than silently stripping standing other people rely on.
+    // Clearing it first is a deliberate act, taken on the Groups page.
+    if (tier === TIERS.SUPER) {
+      const { rows: administered } = await query(
+        `SELECT g.name FROM group_members m JOIN groups g ON g.id = m.group_id
+          WHERE m.user_id = $1 AND m.is_admin ORDER BY g.name`,
+        [req.params.userId],
+      );
+      if (administered.length > 0) {
+        return res.status(409).json({
+          error:
+            `They administer ${administered.map((row) => row.name).join(', ')}. A super ` +
+            'administrator bypasses groups, so clear that on the Groups page first.',
+        });
+      }
     }
 
     // Demoting the last super admin leaves nobody able to run setup or manage
     // admins, which is the same lockout as revoking them outright.
-    if (!superAdmin) {
+    if (tier !== TIERS.SUPER) {
       const { rows: counts } = await query(
         `SELECT count(*)::int AS n FROM users WHERE tier = 'super_admin'`,
       );
@@ -668,9 +804,11 @@ adminRouter.patch('/admins/:userId', requireAdmin, async (req, res, next) => {
         req.params.userId,
       ]);
       if (
-        target[0]?.tier === TIERS.SUPER &&
-        counts[0].n <= 1 &&
-        !(discordActive() && hasBootstrapSupers())
+        stripsLastSuperAdmin({
+          targetTier: target[0]?.tier,
+          superAdminCount: counts[0].n,
+          otherSuperSource: discordActive() && hasBootstrapSupers(),
+        })
       ) {
         return res.status(409).json({
           error: 'This is the only super administrator. Promote another one first.',
@@ -679,15 +817,12 @@ adminRouter.patch('/admins/:userId', requireAdmin, async (req, res, next) => {
     }
 
     const { rowCount } = await query(
-      `UPDATE users SET tier = $2, permissions = $3 WHERE id = $1 AND tier <> 'none'`,
-      [req.params.userId, superAdmin ? TIERS.SUPER : TIERS.ADMIN, permissions],
+      `UPDATE users SET tier = $2 WHERE id = $1 AND tier <> 'none'`,
+      [req.params.userId, tier],
     );
     if (rowCount === 0) return res.status(404).json({ error: 'That admin was not found.' });
 
-    await audit(req.user.id, 'admin.permissions', 'user', req.params.userId, {
-      superAdmin,
-      permissions,
-    });
+    await audit(req.user.id, 'admin.tier', 'user', req.params.userId, { tier });
     return res.json({ ok: true });
   } catch (error) {
     return next(error);

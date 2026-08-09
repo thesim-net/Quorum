@@ -57,6 +57,35 @@ export function effectivePermissionsForGroup(user, ownerGroupId, membership, gra
 }
 
 /**
+ * Every permission a user can exercise somewhere, over any group.
+ *
+ * The union of their own groups' member permissions and of every grant those
+ * groups hold. Advisory only: it answers "can this person publish anything at
+ * all", never "may this person publish THIS survey", which is always resolved
+ * against the owning group by effectivePermissionsForGroup.
+ *
+ * @param {{tier?: string}} user The caller.
+ * @param {Array<{groupId: string, memberPermissions: string[]}>} membership The
+ *   groups the user belongs to, each with that group's member permissions.
+ * @param {Array<{sourceGroupId: string, permissions: string[]}>} grants Every
+ *   cross-group grant.
+ * @returns {Set<string>} The permissions the user holds over at least one group.
+ */
+export function unionOfPermissions(user, membership, grants) {
+  if (isSuper(user)) return new Set(ALL_PERMISSIONS);
+
+  const permissions = new Set();
+  const userGroupIds = new Set(membership.map((entry) => entry.groupId));
+
+  for (const entry of membership) addValid(permissions, entry.memberPermissions);
+  for (const grant of grants) {
+    if (userGroupIds.has(grant.sourceGroupId)) addValid(permissions, grant.permissions);
+  }
+
+  return permissions;
+}
+
+/**
  * The ids of every group whose surveys a user can see.
  *
  * Their own groups, plus every group they hold a grant onto. Super admins see
