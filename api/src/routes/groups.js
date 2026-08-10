@@ -1,21 +1,25 @@
 import { Router } from 'express';
-import { query, transaction } from '../db/pool.js';
+import { query } from '../db/pool.js';
+import { current } from '../lib/settings.js';
+import { PLUGINS, isPluginEnabled } from '../lib/plugins.js';
 import {
   ALL_PERMISSIONS,
   PERMISSION_LABELS,
   TIERS,
   sanitisePermissions,
 } from '../lib/permissionSet.js';
-import { mayGrantGroupAdmin } from '../lib/adminAccounts.js';
+import { SUPER_ADMIN_NEEDS_NO_GROUP, mayGrantGroupAdmin } from '../lib/adminAccounts.js';
 import { administeredGroups, requireGroupControl } from '../lib/groups.js';
 import { requireAdmin, requireGroupAdmin } from '../middleware/session.js';
+import { cachedGuildName } from '../plugins/discord/gate.js';
 
 /**
  * Group management, mounted under /api/admin/groups.
  *
  * Shaping the deployment - creating, renaming and deleting groups, deciding
- * what a group's members may do, and granting one group access to another's
- * surveys - stays a super admin's business, the same class as managing admins.
+ * what a group's members may do and who may take its surveys, and granting one
+ * group access to another's surveys - stays a super admin's business, the same
+ * class as managing admins.
  *
  * Membership is not. An administrator of a group runs that group's membership:
  * who is in it, and which of them administer it alongside them. That authority
@@ -25,6 +29,24 @@ import { requireAdmin, requireGroupAdmin } from '../middleware/session.js';
 export const groupsRouter = Router();
 
 const NAME_MAX = 60;
+
+/** Whether the discord plugin is enabled with a server connected. */
+const discordActive = () =>
+  isPluginEnabled(current().plugins, PLUGINS.DISCORD) && current().discord.configured;
+
+/**
+ * Filters a submitted list of Discord snowflakes.
+ *
+ * The lists reach the Discord API and the gate, so anything that is not an id
+ * is dropped here rather than stored and puzzled over later.
+ *
+ * @param {*} input Whatever the client sent.
+ * @returns {string[]} Valid, de-duplicated ids.
+ */
+const sanitiseIds = (input) =>
+  Array.isArray(input)
+    ? [...new Set(input.map((id) => String(id ?? '').trim()).filter((id) => /^\d{17,20}$/.test(id)))]
+    : [];
 
 /**
  * Records an admin action for the audit trail.
@@ -45,28 +67,41 @@ async function audit(actorId, action, targetType, targetId, meta = {}) {
 }
 
 /**
- * Lists the groups the caller may work with, each with its members, grants and
- * member permissions, plus the admins that can be assigned.
+ * Lists the groups the caller may work with, each with its members, grants,
+ * member permissions and audience, plus the admins that can be assigned.
  *
  * A super admin sees every group. An administrator of a group sees exactly the
  * groups they administer - not the ones they merely belong to - because those
  * are the only ones this page lets them change. Super admins are filtered out
- * of the member and assignable lists for anyone else, keeping the rule that
- * they are not enumerable by the people who merely help run surveys.
+ * of the member lists for anyone else, keeping the rule that they are not
+ * enumerable by the people who merely help run surveys, and out of the
+ * assignable list for everyone, because they cannot be members at all.
+ *
+ * The super admin count comes back once rather than per group: the same people
+ * reach every group, so repeating the number per row would only suggest it
+ * varies.
  */
 groupsRouter.get('/', requireGroupAdmin, async (req, res, next) => {
   try {
-    const [groups, members, grants, admins, administered] = await Promise.all([
-      query('SELECT id, name, is_default, member_permissions FROM groups ORDER BY is_default DESC, name'),
+    const [groups, members, grants, admins, supers, administered] = await Promise.all([
+      query(
+        `SELECT id, name, member_permissions, require_guild, gate_role_ids, gate_channel_ids
+           FROM groups ORDER BY name`,
+      ),
       query(
         `SELECT gm.group_id, gm.is_admin, u.id, u.username, u.display_name, u.tier
            FROM group_members gm JOIN users u ON u.id = gm.user_id
           ORDER BY u.tier DESC, u.username`,
       ),
       query('SELECT source_group_id, target_group_id, permissions FROM group_grants'),
-      // Anyone who can reach the panel can be assigned; super admins bypass
-      // groups but are listed so they can still be added deliberately.
-      query(`SELECT id, username, display_name, tier FROM users WHERE tier <> 'none' ORDER BY tier DESC, username`),
+      // Anyone who can reach the panel and is not a super admin can be
+      // assigned. A super administrator already reaches every group, so a
+      // membership would grant them nothing and imply something untrue.
+      query(
+        `SELECT id, username, display_name, tier FROM users
+          WHERE tier <> 'none' AND tier <> 'super_admin' ORDER BY username`,
+      ),
+      query(`SELECT count(*)::int AS n FROM users WHERE tier = 'super_admin'`),
       req.user.isSuperAdmin ? Promise.resolve(null) : administeredGroups(req.user),
     ]);
 
@@ -99,24 +134,33 @@ groupsRouter.get('/', requireGroupAdmin, async (req, res, next) => {
       // Shaping groups themselves stays super-admin work; the membership of
       // every group returned here is the caller's to run either way.
       canManageGroups: req.user.isSuperAdmin,
+      // Shown against every group, and never folded into its member count:
+      // super administrators reach each group without belonging to any.
+      superAdminCount: supers.rows[0].n,
       groups: groups.rows
         .filter((group) => visible(group.id))
         .map((group) => ({
           id: group.id,
           name: group.name,
-          isDefault: group.is_default,
           memberPermissions: group.member_permissions,
+          requireGuild: group.require_guild,
+          gateRoleIds: group.gate_role_ids,
+          gateChannelIds: group.gate_channel_ids,
           members: membersByGroup.get(group.id) ?? [],
           grants: grantsByGroup.get(group.id) ?? [],
         })),
-      admins: admins.rows
-        .filter((row) => !hidden(row))
-        .map((row) => ({
-          id: row.id,
-          username: row.username,
-          displayName: row.display_name,
-          tier: row.tier,
-        })),
+      admins: admins.rows.map((row) => ({
+        id: row.id,
+        username: row.username,
+        displayName: row.display_name,
+        tier: row.tier,
+      })),
+      // Whether the audience section can offer the guild checkbox at all, and
+      // what to call the server on its label.
+      discord: {
+        ready: discordActive(),
+        guildName: discordActive() ? current().discord.guildName ?? cachedGuildName() : null,
+      },
       catalogue: ALL_PERMISSIONS.map((key) => ({ key, ...PERMISSION_LABELS[key] })),
     });
   } catch (error) {
@@ -153,17 +197,31 @@ groupsRouter.post('/', requireAdmin, async (req, res, next) => {
 });
 
 /**
- * Renames a group, sets its member permissions, or makes it the default.
+ * Renames a group, sets what its members may do, or sets who may take its
+ * surveys.
  *
- * Renaming the default is allowed; there is always exactly one default, so the
- * only way to move it is to promote another group, which demotes the old one.
+ * The audience is the group's, not the survey's: every survey the group owns is
+ * offered to whoever satisfies it. Turning the guild requirement on needs a
+ * connected server, or the group would gate its surveys on something nothing
+ * can answer; only the change is refused, never a save that carries the flag
+ * along, or a gated group could not be edited - including to turn the flag back
+ * off - once its server went away.
  */
 groupsRouter.patch('/:id', requireAdmin, async (req, res, next) => {
   try {
-    const { rows: existing } = await query('SELECT id FROM groups WHERE id = $1', [req.params.id]);
+    const { rows: existing } = await query(
+      'SELECT id, require_guild FROM groups WHERE id = $1',
+      [req.params.id],
+    );
     if (existing.length === 0) return res.status(404).json({ error: 'Group not found.' });
 
     const body = req.body ?? {};
+
+    if (body.requireGuild === true && !existing[0].require_guild && !discordActive()) {
+      return res.status(409).json({
+        error: 'Connect a Discord server before limiting a group to its members.',
+      });
+    }
 
     if (typeof body.name === 'string') {
       const name = body.name.trim();
@@ -188,13 +246,25 @@ groupsRouter.patch('/:id', requireAdmin, async (req, res, next) => {
       ]);
     }
 
-    // Promoting a group to default demotes the previous one in the same
-    // transaction, so the single-default index never sees two at once.
-    if (body.isDefault === true) {
-      await transaction(async (client) => {
-        await client.query('UPDATE groups SET is_default = false WHERE is_default');
-        await client.query('UPDATE groups SET is_default = true WHERE id = $1', [req.params.id]);
-      });
+    if ('requireGuild' in body) {
+      await query('UPDATE groups SET require_guild = $2 WHERE id = $1', [
+        req.params.id,
+        body.requireGuild === true,
+      ]);
+    }
+
+    if ('gateRoleIds' in body) {
+      await query('UPDATE groups SET gate_role_ids = $2 WHERE id = $1', [
+        req.params.id,
+        sanitiseIds(body.gateRoleIds),
+      ]);
+    }
+
+    if ('gateChannelIds' in body) {
+      await query('UPDATE groups SET gate_channel_ids = $2 WHERE id = $1', [
+        req.params.id,
+        sanitiseIds(body.gateChannelIds),
+      ]);
     }
 
     await audit(req.user.id, 'group.update', 'group', req.params.id, {
@@ -209,26 +279,41 @@ groupsRouter.patch('/:id', requireAdmin, async (req, res, next) => {
 /**
  * Deletes a group.
  *
- * The default cannot be deleted; deleting any other group reassigns its surveys
- * to the default first, so a survey is never orphaned.
+ * There is no default group to hand its surveys to any more, so a survey that
+ * belongs to this group and nothing else has nowhere to go: it would be left
+ * takeable by nobody and reachable by nobody. That blocks the delete, and the
+ * refusal says how many surveys are in that position so the decision can be
+ * made rather than guessed at. Surveys that also belong elsewhere simply lose
+ * this one group, which the row cascade does on its own.
  */
 groupsRouter.delete('/:id', requireAdmin, async (req, res, next) => {
   try {
-    const { rows } = await query('SELECT is_default FROM groups WHERE id = $1', [req.params.id]);
+    const { rows } = await query('SELECT id FROM groups WHERE id = $1', [req.params.id]);
     if (rows.length === 0) return res.status(404).json({ error: 'Group not found.' });
-    if (rows[0].is_default) {
-      return res.status(409).json({ error: 'The default group cannot be deleted.' });
+
+    const { rows: stranded } = await query(
+      `SELECT count(*)::int AS n
+         FROM survey_groups sg
+        WHERE sg.group_id = $1
+          AND NOT EXISTS (
+            SELECT 1 FROM survey_groups other
+             WHERE other.survey_id = sg.survey_id AND other.group_id <> $1
+          )`,
+      [req.params.id],
+    );
+    if (stranded[0].n > 0) {
+      return res.status(409).json({
+        error:
+          `${stranded[0].n} survey${stranded[0].n === 1 ? '' : 's'} belong${stranded[0].n === 1 ? 's' : ''} ` +
+          'to this group and no other, and a survey must always have a group. Add another group ' +
+          `to ${stranded[0].n === 1 ? 'it' : 'them'}, or delete ${stranded[0].n === 1 ? 'it' : 'them'}, first.`,
+        surveysAffected: stranded[0].n,
+      });
     }
 
-    await transaction(async (client) => {
-      const { rows: def } = await client.query('SELECT id FROM groups WHERE is_default');
-      await client.query('UPDATE surveys SET group_id = $2 WHERE group_id = $1', [
-        req.params.id,
-        def[0].id,
-      ]);
-      // Members and grants referencing this group cascade away with the row.
-      await client.query('DELETE FROM groups WHERE id = $1', [req.params.id]);
-    });
+    // Members, grants and the surveys' other links to this group cascade away
+    // with the row.
+    await query('DELETE FROM groups WHERE id = $1', [req.params.id]);
 
     await audit(req.user.id, 'group.delete', 'group', req.params.id, {});
     return res.json({ ok: true });
@@ -254,9 +339,12 @@ async function administeredBy(userId) {
 /**
  * Loads the target of a membership change and checks it is one that may be made.
  *
- * A super admin is never the target: they bypass groups, so administering one
- * means nothing to them, and anybody other than a super admin is not supposed
- * to know they exist in the first place.
+ * A super admin is never the target: they reach every group already, so a
+ * membership of one grants them nothing and only suggests their access comes
+ * from it. The same fact is reported two ways on purpose - a super admin is
+ * told plainly that it would be pointless, while anybody else is told the
+ * account was not found, because they are not supposed to know super
+ * administrators exist at all.
  *
  * @param {object} caller The acting admin.
  * @param {string} userId The target account.
@@ -267,8 +355,10 @@ async function loadMemberTarget(caller, userId) {
     userId,
   ]);
   if (rows.length === 0) return { error: 'That admin was not found.', status: 404 };
-  if (rows[0].tier === TIERS.SUPER && !caller.isSuperAdmin) {
-    return { error: 'That admin was not found.', status: 404 };
+  if (rows[0].tier === TIERS.SUPER) {
+    return caller.isSuperAdmin
+      ? { error: SUPER_ADMIN_NEEDS_NO_GROUP, status: 409 }
+      : { error: 'That admin was not found.', status: 404 };
   }
   return { tier: rows[0].tier };
 }
@@ -292,11 +382,6 @@ groupsRouter.post('/:id/members', requireGroupControl(), async (req, res, next) 
 
     const isAdmin = req.body?.isAdmin === true;
     if (isAdmin) {
-      if (target.tier === TIERS.SUPER) {
-        return res.status(409).json({
-          error: 'A super administrator already has every permission everywhere.',
-        });
-      }
       const verdict = mayGrantGroupAdmin(
         req.user,
         await administeredGroups(req.user),
@@ -335,11 +420,6 @@ groupsRouter.patch('/:id/members/:userId', requireGroupControl(), async (req, re
     if (target.error) return res.status(target.status).json({ error: target.error });
 
     if (isAdmin) {
-      if (target.tier === TIERS.SUPER) {
-        return res.status(409).json({
-          error: 'A super administrator already has every permission everywhere.',
-        });
-      }
       const verdict = mayGrantGroupAdmin(
         req.user,
         await administeredGroups(req.user),
@@ -372,11 +452,30 @@ groupsRouter.patch('/:id/members/:userId', requireGroupControl(), async (req, re
  *
  * The membership goes, never the account: deleting an account is a super
  * admin's act, on the Users page.
+ *
+ * Their LAST membership does not go. Membership is the whole of a plain
+ * administrator's access now that there is no default group to fall back on, so
+ * removing the only one leaves an account that reaches the panel and can do
+ * nothing in it - which looks like a bug rather than a decision, and is
+ * invisible to whoever did it. The refusal names the two ways out.
  */
 groupsRouter.delete('/:id/members/:userId', requireGroupControl(), async (req, res, next) => {
   try {
     const target = await loadMemberTarget(req.user, req.params.userId);
     if (target.error) return res.status(target.status).json({ error: target.error });
+
+    const { rows: held } = await query(
+      'SELECT group_id FROM group_members WHERE user_id = $1',
+      [req.params.userId],
+    );
+    if (held.length === 1 && held[0].group_id === req.params.id) {
+      return res.status(409).json({
+        error:
+          'This is the only group they belong to, and an administrator in no group has no access ' +
+          'at all. Add them to another group first, or remove their admin access on the Users page.',
+        lastGroup: true,
+      });
+    }
 
     await query('DELETE FROM group_members WHERE group_id = $1 AND user_id = $2', [
       req.params.id,

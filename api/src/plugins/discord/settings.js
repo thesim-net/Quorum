@@ -34,6 +34,13 @@ function envIsComplete() {
  *   server is connected.
  */
 export function deriveDiscordSettings(row) {
+  // Which group role- and channel-derived admins land in is never pinned to the
+  // environment: it names a row in this deployment's own groups table, so it is
+  // read from the settings row whatever the credentials come from. Unset means
+  // those accounts get no access at all, which is the safe reading of "nobody
+  // has chosen a group for them".
+  const adminGroupId = row?.discord_admin_group_id ?? null;
+
   if (envIsComplete()) {
     return {
       source: 'environment',
@@ -45,6 +52,7 @@ export function deriveDiscordSettings(row) {
       guildName: null,
       adminRoleIds: config.adminRoleIds,
       adminChannelIds: [],
+      adminGroupId,
       readOnly: true,
       error: null,
     };
@@ -56,6 +64,7 @@ export function deriveDiscordSettings(row) {
       configured: false,
       adminRoleIds: config.adminRoleIds,
       adminChannelIds: [],
+      adminGroupId,
       readOnly: false,
       error: null,
     };
@@ -72,6 +81,7 @@ export function deriveDiscordSettings(row) {
       guildName: row.guild_name,
       adminRoleIds: [...config.adminRoleIds, ...row.admin_role_ids],
       adminChannelIds: row.admin_channel_ids ?? [],
+      adminGroupId,
       configuredAt: row.configured_at,
       readOnly: false,
       error: null,
@@ -86,6 +96,7 @@ export function deriveDiscordSettings(row) {
       configured: false,
       adminRoleIds: config.adminRoleIds,
       adminChannelIds: [],
+      adminGroupId,
       readOnly: false,
       error: 'unreadable',
     };
@@ -117,9 +128,9 @@ export async function saveDiscordSettings(values, actorId = null) {
   await query(
     `INSERT INTO app_settings (id, discord_client_id, discord_client_secret_enc,
                                discord_bot_token_enc, discord_guild_id, guild_name,
-                               admin_role_ids, admin_channel_ids, configured_at,
-                               configured_by, updated_at)
-          VALUES (true, $1, $2, $3, $4, $5, $6, $7, now(), $8, now())
+                               admin_role_ids, admin_channel_ids, discord_admin_group_id,
+                               configured_at, configured_by, updated_at)
+          VALUES (true, $1, $2, $3, $4, $5, $6, $7, $8, now(), $9, now())
      ON CONFLICT (id) DO UPDATE
           SET discord_client_id = EXCLUDED.discord_client_id,
               discord_client_secret_enc = EXCLUDED.discord_client_secret_enc,
@@ -128,6 +139,7 @@ export async function saveDiscordSettings(values, actorId = null) {
               guild_name = EXCLUDED.guild_name,
               admin_role_ids = EXCLUDED.admin_role_ids,
               admin_channel_ids = EXCLUDED.admin_channel_ids,
+              discord_admin_group_id = EXCLUDED.discord_admin_group_id,
               configured_at = now(),
               configured_by = COALESCE(EXCLUDED.configured_by, app_settings.configured_by),
               updated_at = now()`,
@@ -139,6 +151,7 @@ export async function saveDiscordSettings(values, actorId = null) {
       values.guildName ?? null,
       values.adminRoleIds ?? [],
       values.adminChannelIds ?? [],
+      values.adminGroupId ?? null,
       actorId,
     ],
   );
@@ -164,6 +177,8 @@ export async function resetDiscordSettings() {
             guild_name = NULL,
             admin_role_ids = '{}',
             admin_channel_ids = '{}',
+            -- The landing group only meant anything alongside those two lists.
+            discord_admin_group_id = NULL,
             configured_at = NULL,
             updated_at = now()
       WHERE id = true`,

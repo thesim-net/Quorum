@@ -6,10 +6,14 @@
 import { query } from '../db/pool.js';
 import { ALL_PERMISSIONS, PERMISSIONS, isSuper } from './permissionSet.js';
 import { administeredGroupIds, administersGroup } from './adminAccounts.js';
+import { current } from './settings.js';
 import {
   accessibleGroupIds,
   effectivePermissionsForGroup,
-  membershipWithFallback,
+  effectivePermissionsForSurvey,
+  groupsWithPermission,
+  membershipWithDiscordGroup,
+  surveyGroupSelection,
   unionOfPermissions,
 } from './groupPermissions.js';
 
@@ -17,7 +21,10 @@ import {
 export {
   accessibleGroupIds,
   effectivePermissionsForGroup,
-  membershipWithFallback,
+  effectivePermissionsForSurvey,
+  groupsWithPermission,
+  membershipWithDiscordGroup,
+  surveyGroupSelection,
   unionOfPermissions,
 };
 
@@ -27,25 +34,32 @@ export {
  * Each membership carries whether it administers its group, since that standing
  * belongs to the membership rather than to the account.
  *
+ * `discordGroup` is the group the Discord plugin puts role- and channel-derived
+ * admins in. It is loaded here rather than at each call site so that the one
+ * kind of admin nobody chose a group for still resolves to something; it is
+ * only applied to those accounts, by `membershipWithDiscordGroup`.
+ *
  * @param {string} userId
  * @returns {Promise<{membership: Array<{groupId: string, memberPermissions: string[],
  *   isAdmin: boolean}>,
  *   grants: Array<{sourceGroupId: string, targetGroupId: string, permissions: string[]}>,
- *   defaultGroup: {id: string, memberPermissions: string[]}|null}>}
+ *   discordGroup: {id: string, memberPermissions: string[]}|null}>}
  */
 export async function loadGroupContext(userId) {
-  const [members, grants, def] = await Promise.all([
+  const discordGroupId = current().discord.adminGroupId ?? null;
+
+  const [members, grants, derived] = await Promise.all([
     query(
-      // Ordered so that "the group they administer", asked of an admin who was
-      // not made to choose one, resolves to the same group every time.
       `SELECT g.id, g.member_permissions, m.is_admin
          FROM group_members m JOIN groups g ON g.id = m.group_id
         WHERE m.user_id = $1
-        ORDER BY g.is_default DESC, g.name`,
+        ORDER BY g.name`,
       [userId],
     ),
     query('SELECT source_group_id, target_group_id, permissions FROM group_grants'),
-    query('SELECT id, member_permissions FROM groups WHERE is_default'),
+    discordGroupId
+      ? query('SELECT id, member_permissions FROM groups WHERE id = $1', [discordGroupId])
+      : Promise.resolve({ rows: [] }),
   ]);
 
   return {
@@ -59,29 +73,56 @@ export async function loadGroupContext(userId) {
       targetGroupId: row.target_group_id,
       permissions: row.permissions,
     })),
-    defaultGroup: def.rows[0]
-      ? { id: def.rows[0].id, memberPermissions: def.rows[0].member_permissions }
+    discordGroup: derived.rows[0]
+      ? { id: derived.rows[0].id, memberPermissions: derived.rows[0].member_permissions }
       : null,
   };
 }
 
 /**
- * The permissions a user holds over one group, resolved against the database.
+ * The memberships a decision about this caller resolves against.
  *
- * An admin who belongs to no group resolves against the default group, which
- * 010 seeds and which cannot be deleted, so there is always something to
- * resolve against.
+ * Their real ones, plus the Discord landing group when their admin tier came
+ * from a role or a channel. There is no other fallback: an administrator in no
+ * group resolves against nothing and can do nothing.
+ *
+ * @param {{tier?: string, discordAdminGroupId?: string|null}} user The caller.
+ * @param {{membership: Array<object>, discordGroup: object|null}} context
+ * @returns {Array<{groupId: string, memberPermissions: string[]}>} Membership.
+ */
+export const resolvedMembership = (user, context) =>
+  membershipWithDiscordGroup(user, context.membership, context.discordGroup);
+
+/**
+ * The groups a survey belongs to.
+ *
+ * @param {string} surveyId
+ * @returns {Promise<string[]>} Group ids, empty when the survey does not exist.
+ */
+export async function surveyGroupIds(surveyId) {
+  const { rows } = await query('SELECT group_id FROM survey_groups WHERE survey_id = $1', [
+    surveyId,
+  ]);
+  return rows.map((row) => row.group_id);
+}
+
+/**
+ * The permissions a user holds over the surveys of one group.
  *
  * @param {{tier?: string, id: string}} user The caller.
- * @param {string} ownerGroupId The owning group.
+ * @param {string} groupId The group.
  * @returns {Promise<Set<string>>} The permissions the user can exercise.
  */
-export async function userGroupPermissions(user, ownerGroupId) {
+export async function userGroupPermissions(user, groupId) {
   if (isSuper(user)) return new Set(ALL_PERMISSIONS);
 
   const context = await loadGroupContext(user.id);
-  const membership = membershipWithFallback(user, context.membership, context.defaultGroup);
-  return effectivePermissionsForGroup(user, ownerGroupId, membership, context.grants);
+  return effectivePermissionsForGroup(
+    user,
+    groupId,
+    resolvedMembership(user, context),
+    context.grants,
+  );
 }
 
 /**
@@ -98,53 +139,101 @@ export async function userPermissionUnion(user) {
   if (isSuper(user)) return new Set(ALL_PERMISSIONS);
 
   const context = await loadGroupContext(user.id);
-  const membership = membershipWithFallback(user, context.membership, context.defaultGroup);
-  return unionOfPermissions(user, membership, context.grants);
+  return unionOfPermissions(user, resolvedMembership(user, context), context.grants);
 }
 
 /**
- * Chooses and authorises the group a new survey will belong to.
+ * The groups a caller may place a survey in, in the order they are offered.
  *
- * The caller may name a group; when they do not, it defaults to their first
- * group, or the deployment default. Either way they must hold surveys.write
- * over the chosen group. Super admins may create in any group.
+ * Every group for a super admin; for anybody else, exactly the groups where
+ * they hold surveys.write, whether from their own membership or from a
+ * cross-group grant. Nothing is preselected anywhere: there is no default group
+ * to fall back on, so choosing is the creator's to do.
  *
  * @param {{tier?: string, id: string}} user The caller.
- * @param {string|null|undefined} requestedGroupId A group id from the request.
- * @returns {Promise<{groupId: string}|{error: string, status: number}>}
+ * @returns {Promise<Array<{id: string, name: string}>>} Groups they may write in.
  */
-export async function resolveCreateGroup(user, requestedGroupId) {
-  const requested = requestedGroupId ? String(requestedGroupId) : null;
-
-  if (isSuper(user)) {
-    if (requested) {
-      const { rows } = await query('SELECT id FROM groups WHERE id = $1', [requested]);
-      if (rows.length === 0) return { error: 'That group does not exist.', status: 404 };
-      return { groupId: requested };
-    }
-    const { rows } = await query('SELECT id FROM groups WHERE is_default');
-    if (rows.length === 0) return { error: 'No group is available to own the survey.', status: 409 };
-    return { groupId: rows[0].id };
-  }
+export async function writableGroups(user) {
+  const { rows } = await query('SELECT id, name FROM groups ORDER BY name');
+  if (isSuper(user)) return rows.map((row) => ({ id: row.id, name: row.name }));
 
   const context = await loadGroupContext(user.id);
-  const membership = membershipWithFallback(user, context.membership, context.defaultGroup);
-  const groupId = requested ?? membership[0]?.groupId ?? context.defaultGroup?.id ?? null;
-  if (!groupId) return { error: 'You are not a member of any group.', status: 403 };
-
-  const permissions = effectivePermissionsForGroup(user, groupId, membership, context.grants);
-  if (!permissions.has(PERMISSIONS.SURVEYS_WRITE)) {
-    return { error: 'You cannot create surveys in that group.', status: 403 };
-  }
-  return { groupId };
+  return groupsWithPermission(
+    user,
+    rows,
+    resolvedMembership(user, context),
+    context.grants,
+    PERMISSIONS.SURVEYS_WRITE,
+  );
 }
 
 /**
- * Middleware that authorises one permission against the owning group of the
- * survey named by `req.params.id`.
+ * Validates and authorises the groups a survey is being placed in.
  *
- * Super admins pass straight through. A missing survey is a 404 so the guard
- * behaves like the routes it fronts.
+ * A survey must always belong to at least one group, and the caller may only
+ * add it to groups they can write in. There is no default and nothing is
+ * implied: an empty list is refused rather than quietly filled in.
+ *
+ * `current` is what the survey already belongs to, and only matters on an
+ * update. A survey shared with a group the caller cannot write in is still
+ * theirs to edit - one group's surveys.write covers the whole survey - but that
+ * other group's claim on it is not theirs to add or drop. So groups they cannot
+ * write in are left exactly as they found them, which is why the two directions
+ * are checked separately rather than by one sweep over the new list.
+ *
+ * @param {{tier?: string, id: string}} user The caller.
+ * @param {*} requested Whatever the request sent as the group list.
+ * @param {string[]} current The groups the survey belongs to now.
+ * @returns {Promise<{groupIds: string[]}|{error: string, status: number}>}
+ */
+export async function resolveSurveyGroups(user, requested, current = []) {
+  const selection = surveyGroupSelection(requested);
+  if (selection.error) return selection;
+  const ids = selection.groupIds;
+
+  const { rows } = await query('SELECT id FROM groups WHERE id = ANY($1::uuid[])', [ids]);
+  if (rows.length !== ids.length) {
+    return { error: 'One of those groups does not exist.', status: 404 };
+  }
+
+  if (isSuper(user)) return { groupIds: ids };
+
+  const context = await loadGroupContext(user.id);
+  const membership = resolvedMembership(user, context);
+  const mayWrite = (groupId) =>
+    effectivePermissionsForGroup(user, groupId, membership, context.grants).has(
+      PERMISSIONS.SURVEYS_WRITE,
+    );
+
+  const held = new Set(current);
+  const wanted = new Set(ids);
+
+  for (const groupId of ids) {
+    if (!held.has(groupId) && !mayWrite(groupId)) {
+      return { error: 'You cannot create surveys in one of those groups.', status: 403 };
+    }
+  }
+
+  for (const groupId of current) {
+    if (!wanted.has(groupId) && !mayWrite(groupId)) {
+      return {
+        error: 'You cannot take this survey away from a group you cannot create surveys in.',
+        status: 403,
+      };
+    }
+  }
+
+  return { groupIds: ids };
+}
+
+/**
+ * Middleware that authorises one permission against a survey's groups.
+ *
+ * Holding the permission over any ONE of them is enough: each group a survey
+ * belongs to owns it as fully as the others. Super admins pass straight
+ * through, and a missing survey is a 404 so the guard behaves like the routes
+ * it fronts. A survey that has somehow been left with no groups is refused
+ * rather than opened up, since there is nothing to resolve against.
  *
  * @param {string} permission One of PERMISSIONS.
  * @returns {import('express').RequestHandler}
@@ -155,10 +244,18 @@ export function requireSurveyPermission(permission) {
       if (!req.user) return res.status(401).json({ error: 'Sign in to continue.' });
       if (isSuper(req.user)) return next();
 
-      const { rows } = await query('SELECT group_id FROM surveys WHERE id = $1', [req.params.id]);
+      const { rows } = await query('SELECT id FROM surveys WHERE id = $1', [req.params.id]);
       if (rows.length === 0) return res.status(404).json({ error: 'Survey not found.' });
 
-      const permissions = await userGroupPermissions(req.user, rows[0].group_id);
+      const groupIds = await surveyGroupIds(req.params.id);
+      const context = await loadGroupContext(req.user.id);
+      const permissions = effectivePermissionsForSurvey(
+        req.user,
+        groupIds,
+        resolvedMembership(req.user, context),
+        context.grants,
+      );
+
       if (!permissions.has(permission)) {
         return res.status(403).json({
           error: 'You do not have permission to do that.',
@@ -218,9 +315,9 @@ export function requireGroupControl(param = 'id') {
  * Middleware that authorises one permission against any group at all.
  *
  * For the handful of endpoints that serve no particular survey - listing a
- * Discord server's roles and channels so a gate can be configured, say - where
- * there is no owning group to resolve against. Anything that does name a survey
- * uses `requireSurveyPermission` instead, which is narrower.
+ * Discord server's roles and channels so a group's audience can be configured,
+ * say - where there is no owning group to resolve against. Anything that does
+ * name a survey uses `requireSurveyPermission` instead, which is narrower.
  *
  * @param {string} permission One of PERMISSIONS.
  * @returns {import('express').RequestHandler}

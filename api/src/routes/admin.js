@@ -42,12 +42,14 @@ import {
 } from '../lib/adminAccounts.js';
 import {
   accessibleGroupIds,
-  effectivePermissionsForGroup,
+  effectivePermissionsForSurvey,
   loadGroupContext,
-  membershipWithFallback,
   requireSurveyPermission,
-  resolveCreateGroup,
+  resolveSurveyGroups,
+  resolvedMembership,
+  surveyGroupIds,
   userPermissionUnion,
+  writableGroups,
 } from '../lib/groups.js';
 import { groupsRouter } from './groups.js';
 import { postMessage } from '../plugins/discord/discord.js';
@@ -245,7 +247,14 @@ function slugify(title) {
  */
 async function pluginUsage() {
   const { rows } = await query(
-    `SELECT s.id, s.title, s.plugin_config, s.require_guild,
+    // A survey depends on Discord when one of its groups gates on the guild:
+    // the audience lives on the group now, so the dependency is read from
+    // there rather than from a column on the survey.
+    `SELECT s.id, s.title, s.plugin_config,
+            EXISTS (
+              SELECT 1 FROM survey_groups sg JOIN groups g ON g.id = sg.group_id
+               WHERE sg.survey_id = s.id AND g.require_guild
+            ) AS require_guild,
             EXISTS (SELECT 1 FROM questions q WHERE q.survey_id = s.id AND q.config ? 'showIf')
               AS has_conditional
        FROM surveys s
@@ -266,10 +275,10 @@ async function pluginUsage() {
     const config = row.plugin_config ?? {};
     const entry = { id: row.id, title: row.title };
 
-    // A survey gated on the guild needs Discord to let anybody in at all;
-    // disabling the plugin under it would close it to everyone rather than
-    // opening it to all. Role and channel lists alone are inert while the guild
-    // checkbox is off, so they no longer count as a dependency on their own.
+    // A survey whose group gates on the guild needs Discord to let anybody in
+    // through that group; disabling the plugin under it would close that route
+    // rather than open it. Role and channel lists alone are inert while the
+    // guild checkbox is off, so they never count as a dependency on their own.
     if (row.require_guild) usage[PLUGINS.DISCORD].push(entry);
     if (config.announceChannelId) usage[PLUGINS.ANNOUNCEMENTS].push(entry);
     if (config.remindHoursBeforeClose !== undefined && config.remindHoursBeforeClose !== null) {
@@ -498,9 +507,9 @@ adminRouter.get('/admins', async (req, res, next) => {
       query(
         `SELECT m.user_id, m.is_admin, g.id, g.name
            FROM group_members m JOIN groups g ON g.id = m.group_id
-          ORDER BY g.is_default DESC, g.name`,
+          ORDER BY g.name`,
       ),
-      query('SELECT id, name, is_default FROM groups ORDER BY is_default DESC, name'),
+      query('SELECT id, name FROM groups ORDER BY name'),
       req.user.isSuperAdmin ? Promise.resolve(null) : loadGroupContext(req.user.id),
     ]);
 
@@ -514,15 +523,24 @@ adminRouter.get('/admins', async (req, res, next) => {
       });
     }
 
-    // Where a new account may be put. A super admin may choose any group, or
-    // none; anybody else invites into a group they administer and no other, so
-    // the client cannot even offer somebody else's group.
+    // Where a new account may be put. A super admin may choose any group;
+    // anybody else invites into a group they administer and no other, so the
+    // client cannot even offer somebody else's group. Choosing is mandatory
+    // either way - there is no default group to fall back on any more, and an
+    // administrator in no group can do nothing at all.
     const administered = context ? administeredGroupIds(context.membership) : null;
     const inviteGroups = allGroups.rows.filter(
       (row) => administered === null || administered.has(row.id),
     );
 
     const settings = current();
+    // The group Discord role- and channel-derived admins land in. Named here so
+    // the page can say what those rows actually mean instead of guessing.
+    const derivedGroupId = settings.discord.adminGroupId ?? null;
+    const derivedGroup = derivedGroupId
+      ? allGroups.rows.find((row) => row.id === derivedGroupId) ?? null
+      : null;
+
     let roles = [];
     let channels = [];
     let bootstrapIds = [];
@@ -566,12 +584,12 @@ adminRouter.get('/admins', async (req, res, next) => {
           isSelf: row.id === req.user.id,
         };
       }),
-      // The groups a new account may be placed into, most-default first.
-      groups: inviteGroups.map((row) => ({
-        id: row.id,
-        name: row.name,
-        isDefault: row.is_default,
-      })),
+      // The groups a new account may be placed into. One of them must be
+      // chosen; nothing is preselected.
+      groups: inviteGroups.map((row) => ({ id: row.id, name: row.name })),
+      // Where a Discord role or channel lands somebody, or null when the plugin
+      // has not been told - in which case those accounts get no access at all.
+      discordAdminGroup: derivedGroup ? { id: derivedGroup.id, name: derivedGroup.name } : null,
       // Not revocable from here: these come from configuration, not a grant.
       bootstrapIds,
       adminRoles: roles,
@@ -585,8 +603,14 @@ adminRouter.get('/admins', async (req, res, next) => {
 /**
  * Creates a local admin account.
  *
- * An account is a tier and a group, nothing more. A super admin may name any
- * group or none, because an admin in no group resolves against the default one.
+ * An account is a tier and a group, nothing more, and the group is now
+ * mandatory: there is no default to fall back on, so an administrator created
+ * without one would reach the panel and be able to do nothing in it. The refusal
+ * lives here rather than in the form, because it is the only place that cannot
+ * be skipped. A super administrator is the exception in the other direction -
+ * they bypass groups entirely, so naming one for them is refused rather than
+ * obeyed and then undone.
+ *
  * A group administrator invites into the group they administer: the server
  * settles which group that is rather than trusting the form, so a request
  * naming somebody else's group is refused instead of quietly obeyed.
@@ -621,12 +645,13 @@ adminRouter.post('/admins', requireGroupAdmin, async (req, res, next) => {
     const membership = req.user.isSuperAdmin
       ? []
       : (await loadGroupContext(req.user.id)).membership;
-    const target = resolveInviteGroup(req.user, membership, requestedGroupId(req.body));
+    const target = resolveInviteGroup(
+      req.user,
+      membership,
+      requestedGroupId(req.body),
+      standing.tier,
+    );
     if (target.error) return res.status(target.status).json({ error: target.error });
-
-    if (standing.groupAdmin && !target.groupId) {
-      return res.status(400).json({ error: 'Choose the group they will administer.' });
-    }
 
     const { rows: existing } = await query(
       'SELECT 1 FROM users WHERE lower(username) = lower($1) AND password_hash IS NOT NULL',
@@ -762,6 +787,16 @@ adminRouter.delete('/admins/:userId', requireAdmin, async (req, res, next) => {
  * it is granted and revoked per group on the Groups page. Changing your own is
  * refused for the same reason revoking yourself is: it is the quickest way to
  * lock the panel and there is no way back from inside it.
+ *
+ * Both directions have to keep the model true, and they are mirror images:
+ *
+ *   - Promoting clears every group membership the account holds, in the same
+ *     transaction as the tier change. A super administrator reaches every group
+ *     already, so a membership grants them nothing and only suggests their
+ *     access comes from that group.
+ *   - Demoting therefore lands somebody in no group at all, which is now no
+ *     access at all. A destination group is required, and the demotion is
+ *     refused without one rather than quietly stranding the account.
  */
 adminRouter.patch('/admins/:userId', requireAdmin, async (req, res, next) => {
   try {
@@ -775,24 +810,10 @@ adminRouter.patch('/admins/:userId', requireAdmin, async (req, res, next) => {
     if (standing.error) return res.status(400).json({ error: standing.error });
     const tier = standing.tier;
 
-    // Super admin and group administrator are exclusive, and a super admin
-    // bypasses groups, so promoting somebody who still administers one is
-    // refused rather than silently stripping standing other people rely on.
-    // Clearing it first is a deliberate act, taken on the Groups page.
-    if (tier === TIERS.SUPER) {
-      const { rows: administered } = await query(
-        `SELECT g.name FROM group_members m JOIN groups g ON g.id = m.group_id
-          WHERE m.user_id = $1 AND m.is_admin ORDER BY g.name`,
-        [req.params.userId],
-      );
-      if (administered.length > 0) {
-        return res.status(409).json({
-          error:
-            `They administer ${administered.map((row) => row.name).join(', ')}. A super ` +
-            'administrator bypasses groups, so clear that on the Groups page first.',
-        });
-      }
-    }
+    const { rows: target } = await query('SELECT tier FROM users WHERE id = $1', [
+      req.params.userId,
+    ]);
+    if (target.length === 0) return res.status(404).json({ error: 'That admin was not found.' });
 
     // Demoting the last super admin leaves nobody able to run setup or manage
     // admins, which is the same lockout as revoking them outright.
@@ -800,12 +821,9 @@ adminRouter.patch('/admins/:userId', requireAdmin, async (req, res, next) => {
       const { rows: counts } = await query(
         `SELECT count(*)::int AS n FROM users WHERE tier = 'super_admin'`,
       );
-      const { rows: target } = await query('SELECT tier FROM users WHERE id = $1', [
-        req.params.userId,
-      ]);
       if (
         stripsLastSuperAdmin({
-          targetTier: target[0]?.tier,
+          targetTier: target[0].tier,
           superAdminCount: counts[0].n,
           otherSuperSource: discordActive() && hasBootstrapSupers(),
         })
@@ -816,13 +834,51 @@ adminRouter.patch('/admins/:userId', requireAdmin, async (req, res, next) => {
       }
     }
 
-    const { rowCount } = await query(
-      `UPDATE users SET tier = $2 WHERE id = $1 AND tier <> 'none'`,
-      [req.params.userId, tier],
-    );
+    // Coming down from super admin, the account holds no memberships by
+    // construction, so without a group it would reach the panel and be able to
+    // do nothing. Say so, rather than letting it happen quietly.
+    const demoting = target[0].tier === TIERS.SUPER && tier !== TIERS.SUPER;
+    const landingGroupId = demoting ? requestedGroupId(req.body) : null;
+    if (demoting) {
+      if (!landingGroupId) {
+        return res.status(400).json({
+          error:
+            'Choose the group they will belong to. A super administrator holds no group ' +
+            'membership, so demoting them without one would leave them no access at all.',
+          requiresGroup: true,
+        });
+      }
+      const { rows: group } = await query('SELECT id FROM groups WHERE id = $1', [landingGroupId]);
+      if (group.length === 0) return res.status(404).json({ error: 'That group does not exist.' });
+    }
+
+    const rowCount = await transaction(async (client) => {
+      const result = await client.query(
+        `UPDATE users SET tier = $2 WHERE id = $1 AND tier <> 'none'`,
+        [req.params.userId, tier],
+      );
+      if (result.rowCount === 0) return 0;
+
+      if (tier === TIERS.SUPER) {
+        // Super admin and group membership can never coexist, in either
+        // direction: this is the direction that would otherwise leave stale
+        // memberships behind, including ones that administer a group.
+        await client.query('DELETE FROM group_members WHERE user_id = $1', [req.params.userId]);
+      } else if (landingGroupId) {
+        await client.query(
+          `INSERT INTO group_members (group_id, user_id) VALUES ($1, $2)
+           ON CONFLICT DO NOTHING`,
+          [landingGroupId, req.params.userId],
+        );
+      }
+      return result.rowCount;
+    });
     if (rowCount === 0) return res.status(404).json({ error: 'That admin was not found.' });
 
-    await audit(req.user.id, 'admin.tier', 'user', req.params.userId, { tier });
+    await audit(req.user.id, 'admin.tier', 'user', req.params.userId, {
+      tier,
+      groupId: landingGroupId,
+    });
     return res.json({ ok: true });
   } catch (error) {
     return next(error);
@@ -836,52 +892,57 @@ adminRouter.patch('/admins/:userId', requireAdmin, async (req, res, next) => {
 /**
  * Lists surveys the caller can reach, with headline response counts.
  *
- * A survey is visible when it belongs to one of the caller's groups or to a
- * group they hold a grant onto; super admins see everything. Each row carries
- * the caller's own permissions over its owning group, so the client can show
- * only the actions that survey allows them.
+ * A survey is visible when it belongs to one of the caller's groups, or to a
+ * group they hold a grant onto - any one of its groups is enough, since each of
+ * them owns it. Super admins see everything. Each row carries the caller's own
+ * permissions over that survey, resolved as the union across its groups, so the
+ * client can show only the actions it actually allows them.
  */
 adminRouter.get('/surveys', async (req, res, next) => {
   try {
     const context = await loadGroupContext(req.user.id);
-    const membership = membershipWithFallback(req.user, context.membership, context.defaultGroup);
+    const membership = resolvedMembership(req.user, context);
     const accessible = req.user.isSuperAdmin
       ? null
       : accessibleGroupIds(req.user, membership, context.grants);
 
-    const { rows } = await query(
-      `SELECT s.id, s.slug, s.title, s.status, s.created_at, s.closes_at,
-              s.opens_at, s.group_id, gr.name AS group_name,
-              s.collect_timing, s.collect_location, s.collect_identity,
-              s.allow_response_edits, s.one_response_per_person, s.require_guild,
-              -- Both joins fan out, so every count here must be DISTINCT or the
-              -- two tables multiply each other's rows.
-              count(DISTINCT q.id)                                       AS question_count,
-              count(DISTINCT r.id)                                       AS started,
-              count(DISTINCT r.id) FILTER (WHERE r.status = 'completed') AS completed
-         FROM surveys s
-         LEFT JOIN groups gr ON gr.id = s.group_id
-         LEFT JOIN questions q ON q.survey_id = s.id
-         LEFT JOIN responses r ON r.survey_id = s.id
-        GROUP BY s.id, gr.name
-        ORDER BY s.created_at DESC`,
-    );
-
-    // Permissions are the same for every survey in a group, so resolve once.
-    const permsByGroup = new Map();
-    const permsFor = (groupId) => {
-      if (req.user.isSuperAdmin) return ALL_PERMISSIONS;
-      if (!permsByGroup.has(groupId)) {
-        permsByGroup.set(groupId, [
-          ...effectivePermissionsForGroup(req.user, groupId, membership, context.grants),
-        ]);
-      }
-      return permsByGroup.get(groupId);
-    };
+    const [{ rows }, groups] = await Promise.all([
+      query(
+        `SELECT s.id, s.slug, s.title, s.status, s.created_at, s.closes_at,
+                s.opens_at,
+                s.collect_timing, s.collect_location, s.collect_identity,
+                s.allow_response_edits, s.one_response_per_person,
+                -- Every join here fans out, so each count must be DISTINCT or
+                -- the tables multiply each other's rows.
+                count(DISTINCT q.id)                                       AS question_count,
+                count(DISTINCT r.id)                                       AS started,
+                count(DISTINCT r.id) FILTER (WHERE r.status = 'completed') AS completed,
+                COALESCE(
+                  jsonb_agg(DISTINCT jsonb_build_object('id', gr.id, 'name', gr.name))
+                    FILTER (WHERE gr.id IS NOT NULL),
+                  '[]'::jsonb
+                ) AS groups,
+                bool_or(gr.require_guild) AS gated
+           FROM surveys s
+           LEFT JOIN survey_groups sg ON sg.survey_id = s.id
+           LEFT JOIN groups gr ON gr.id = sg.group_id
+           LEFT JOIN questions q ON q.survey_id = s.id
+           LEFT JOIN responses r ON r.survey_id = s.id
+          GROUP BY s.id
+          ORDER BY s.created_at DESC`,
+      ),
+      // The groups a new survey may be placed in. Sent with the list because
+      // creating one starts here and now demands a choice.
+      writableGroups(req.user),
+    ]);
 
     res.json({
+      groups,
       surveys: rows
-        .filter((row) => accessible === null || accessible.has(row.group_id))
+        .filter(
+          (row) =>
+            accessible === null || row.groups.some((group) => accessible.has(group.id)),
+        )
         .map((row) => ({
           id: row.id,
           slug: row.slug,
@@ -891,13 +952,21 @@ adminRouter.get('/surveys', async (req, res, next) => {
           opensAt: row.opens_at,
           closesAt: row.closes_at,
           state: liveState(row),
-          gated: row.require_guild,
+          gated: row.gated === true,
           questionCount: Number(row.question_count),
           started: Number(row.started),
           completed: Number(row.completed),
-          groupId: row.group_id,
-          groupName: row.group_name,
-          permissions: permsFor(row.group_id),
+          groups: row.groups,
+          permissions: req.user.isSuperAdmin
+            ? ALL_PERMISSIONS
+            : [
+                ...effectivePermissionsForSurvey(
+                  req.user,
+                  row.groups.map((group) => group.id),
+                  membership,
+                  context.grants,
+                ),
+              ],
           collect: {
             timing: row.collect_timing,
             location: row.collect_location,
@@ -913,30 +982,42 @@ adminRouter.get('/surveys', async (req, res, next) => {
 });
 
 /**
- * Creates a draft survey in a group.
+ * Creates a draft survey in one or more groups.
  *
- * The owning group comes from the request or defaults to the caller's own
- * group; either way they must hold surveys.write over it.
+ * The groups come from the request and nothing is implied: a survey must belong
+ * to at least one, and the creator must hold surveys.write over every one they
+ * name. There is no default to fall back on, so a request naming none is
+ * refused with something the creator can act on.
  */
 adminRouter.post('/surveys', async (req, res, next) => {
   try {
     const title = String(req.body?.title ?? '').trim();
     if (!title) return res.status(400).json({ error: 'A title is required.' });
 
-    const target = await resolveCreateGroup(req.user, req.body?.groupId);
+    const target = await resolveSurveyGroups(req.user, req.body?.groupIds);
     if (target.error) return res.status(target.status).json({ error: target.error });
 
-    const { rows } = await query(
-      `INSERT INTO surveys (slug, title, description, created_by, group_id)
-       VALUES ($1, $2, $3, $4, $5) RETURNING id, slug`,
-      [slugify(title), title, String(req.body?.description ?? ''), req.user.id, target.groupId],
-    );
-
-    await audit(req.user.id, 'survey.create', 'survey', rows[0].id, {
-      title,
-      groupId: target.groupId,
+    // The survey and its groups are one act: a survey that exists in no group
+    // is takeable by nobody and reachable by nobody.
+    const created = await transaction(async (client) => {
+      const { rows } = await client.query(
+        `INSERT INTO surveys (slug, title, description, created_by)
+         VALUES ($1, $2, $3, $4) RETURNING id, slug`,
+        [slugify(title), title, String(req.body?.description ?? ''), req.user.id],
+      );
+      await client.query(
+        `INSERT INTO survey_groups (survey_id, group_id)
+         SELECT $1, unnest($2::uuid[])`,
+        [rows[0].id, target.groupIds],
+      );
+      return rows[0];
     });
-    return res.status(201).json({ survey: rows[0] });
+
+    await audit(req.user.id, 'survey.create', 'survey', created.id, {
+      title,
+      groupIds: target.groupIds,
+    });
+    return res.status(201).json({ survey: created });
   } catch (error) {
     return next(error);
   }
@@ -949,6 +1030,15 @@ adminRouter.get('/surveys/:id', writeSurveys, async (req, res, next) => {
     if (rows.length === 0) return res.status(404).json({ error: 'Survey not found.' });
 
     const survey = rows[0];
+    const [surveyGroups, assignable] = await Promise.all([
+      query(
+        `SELECT g.id, g.name, g.require_guild, g.gate_role_ids, g.gate_channel_ids
+           FROM survey_groups sg JOIN groups g ON g.id = sg.group_id
+          WHERE sg.survey_id = $1 ORDER BY g.name`,
+        [survey.id],
+      ),
+      writableGroups(req.user),
+    ]);
     const { rows: questions } = await query(
       'SELECT * FROM questions WHERE survey_id = $1 ORDER BY position',
       [survey.id],
@@ -988,15 +1078,25 @@ adminRouter.get('/surveys/:id', writeSurveys, async (req, res, next) => {
         collectTiming: survey.collect_timing,
         collectLocation: survey.collect_location,
         collectIdentity: survey.collect_identity,
-        requireGuild: survey.require_guild,
-        gateRoleIds: survey.gate_role_ids,
-        gateChannelIds: survey.gate_channel_ids,
+        groupIds: surveyGroups.rows.map((row) => row.id),
         pluginConfig: survey.plugin_config ?? {},
       },
+      // The groups this survey belongs to, each with the audience it carries,
+      // so the editor can say who can take it without owning that decision -
+      // changing it is done on the Groups page, for the group.
+      groups: surveyGroups.rows.map((row) => ({
+        id: row.id,
+        name: row.name,
+        requireGuild: row.require_guild,
+        roleCount: (row.gate_role_ids ?? []).length,
+        channelCount: (row.gate_channel_ids ?? []).length,
+      })),
+      // The groups the caller may place this survey in.
+      assignableGroups: assignable,
       plugins: current().plugins ?? {},
-      // Whether the guild checkbox can be offered at all, and what to call the
-      // server on its label. The name is whatever is already known; the editor
-      // falls back to generic wording rather than waiting on Discord for it.
+      // What to call the connected server in the audience summary. The name is
+      // whatever is already known; the editor falls back to generic wording
+      // rather than waiting on Discord for it.
       discord: {
         ready: discordActive(),
         guildName: discordActive() ? current().discord.guildName ?? cachedGuildName() : null,
@@ -1061,20 +1161,22 @@ const EDITABLE = {
   collectTiming: 'collect_timing',
   collectLocation: 'collect_location',
   collectIdentity: 'collect_identity',
-  requireGuild: 'require_guild',
-  gateRoleIds: 'gate_role_ids',
-  gateChannelIds: 'gate_channel_ids',
   pluginConfig: 'plugin_config',
 };
 
 /**
- * Updates survey settings.
+ * Updates survey settings, and the groups the survey belongs to.
  *
  * Turning `collectIdentity` off also erases the identities already recorded,
  * so the toggle means the same thing retroactively as it does going forward.
  * Turning `oneResponsePerPerson` on or off rewrites the flag its responses
  * carry, for the same reason: the setting has to mean what it says about the
  * responses already in hand, not only the next one.
+ *
+ * `groupIds` replaces the whole set at once, and never with nothing: a survey
+ * left in no group would be takeable by nobody and reachable by nobody, so
+ * removing the last one is refused. Every named group must be one the caller
+ * can write in, so a survey cannot be pushed into somebody else's group.
  */
 adminRouter.patch('/surveys/:id', writeSurveys, async (req, res, next) => {
   try {
@@ -1086,20 +1188,15 @@ adminRouter.patch('/surveys/:id', writeSurveys, async (req, res, next) => {
       if (problem) return res.status(400).json({ error: problem });
     }
 
-    // A survey cannot be newly tied to a Discord server this deployment has not
-    // connected: it would publish as gated and then refuse everybody. Only the
-    // change is refused, never a save that happens to carry the flag along, or
-    // an already-gated survey could not be edited - including to turn the flag
-    // back off - once its server went away.
-    if (req.body.requireGuild === true && !discordActive()) {
-      const { rows } = await query('SELECT require_guild FROM surveys WHERE id = $1', [
-        req.params.id,
-      ]);
-      if (rows.length > 0 && !rows[0].require_guild) {
-        return res.status(409).json({
-          error: 'Connect a Discord server before limiting a survey to its members.',
-        });
-      }
+    let groupIds = null;
+    if ('groupIds' in req.body) {
+      const target = await resolveSurveyGroups(
+        req.user,
+        req.body.groupIds,
+        await surveyGroupIds(req.params.id),
+      );
+      if (target.error) return res.status(target.status).json({ error: target.error });
+      groupIds = target.groupIds;
     }
 
     const sets = [];
@@ -1110,17 +1207,39 @@ adminRouter.patch('/surveys/:id', writeSurveys, async (req, res, next) => {
       values.push(req.body[field]);
       sets.push(`${column} = $${values.length}`);
     }
-    if (sets.length === 0) return res.status(400).json({ error: 'Nothing to update.' });
+    if (sets.length === 0 && !groupIds) {
+      return res.status(400).json({ error: 'Nothing to update.' });
+    }
 
     let updated;
     try {
       updated = await transaction(async (client) => {
-        const { rows } = await client.query(
-          `UPDATE surveys SET ${sets.join(', ')}, updated_at = now()
-            WHERE id = $1 RETURNING id, collect_identity`,
-          values,
-        );
+        const { rows } = sets.length
+          ? await client.query(
+              `UPDATE surveys SET ${sets.join(', ')}, updated_at = now()
+                WHERE id = $1 RETURNING id, collect_identity`,
+              values,
+            )
+          : await client.query(
+              `UPDATE surveys SET updated_at = now()
+                WHERE id = $1 RETURNING id, collect_identity`,
+              [req.params.id],
+            );
         if (rows.length === 0) return null;
+
+        if (groupIds) {
+          await client.query(
+            `DELETE FROM survey_groups
+              WHERE survey_id = $1 AND NOT (group_id = ANY($2::uuid[]))`,
+            [req.params.id, groupIds],
+          );
+          await client.query(
+            `INSERT INTO survey_groups (survey_id, group_id)
+             SELECT $1, unnest($2::uuid[])
+             ON CONFLICT DO NOTHING`,
+            [req.params.id, groupIds],
+          );
+        }
 
         // Each response carries a copy of the survey's one-per-person setting,
         // because that is the only way a partial unique index can enforce it.
@@ -1172,7 +1291,16 @@ adminRouter.post('/surveys/:id/status', publishSurveys, async (req, res, next) =
     }
 
     const { rows: existing } = await query(
-      'SELECT opens_at, closes_at, require_guild FROM surveys WHERE id = $1',
+      `SELECT s.opens_at, s.closes_at,
+              -- Every way in goes through Discord only when every group does;
+              -- one open group is enough to keep the survey takeable.
+              bool_and(g.require_guild) FILTER (WHERE g.id IS NOT NULL) AS all_gated,
+              count(g.id) AS group_count
+         FROM surveys s
+         LEFT JOIN survey_groups sg ON sg.survey_id = s.id
+         LEFT JOIN groups g ON g.id = sg.group_id
+        WHERE s.id = $1
+        GROUP BY s.id`,
       [req.params.id],
     );
     if (existing.length === 0) return res.status(404).json({ error: 'Survey not found.' });
@@ -1186,14 +1314,21 @@ adminRouter.post('/surveys/:id/status', publishSurveys, async (req, res, next) =
         return res.status(400).json({ error: 'Add at least one question before opening.' });
       }
 
-      // A gated survey fails closed when Discord is not there to check the
-      // server, so opening one in that state would publish a survey nobody can
-      // take. Said here rather than discovered by its participants.
-      if (existing[0].require_guild && !discordActive()) {
+      if (Number(existing[0].group_count) === 0) {
+        return res.status(409).json({
+          error: 'This survey belongs to no group, so nobody could take it. Give it one first.',
+        });
+      }
+
+      // A gated group fails closed when Discord is not there to check the
+      // server, so opening a survey whose every group is gated would publish
+      // one nobody can take. Said here rather than discovered by participants.
+      if (existing[0].all_gated === true && !discordActive()) {
         return res.status(409).json({
           error:
-            'This survey is limited to members of a Discord server, and no server is connected. ' +
-            'Connect one, or turn that limit off, before opening it.',
+            'Every group this survey belongs to is limited to members of a Discord server, and ' +
+            'no server is connected. Connect one, add a group without that limit, or turn the ' +
+            'limit off on the Groups page before opening it.',
         });
       }
     }

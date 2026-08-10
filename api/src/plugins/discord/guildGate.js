@@ -1,16 +1,22 @@
 /**
- * Pure access policy for the per-survey Discord guild gate.
+ * Pure access policy for the Discord guild gate.
  *
- * A survey is either tied to the connected Discord server or it is not. Not
- * tied - the default - means truly anonymous: no sign-in, no Discord call, and
- * the role and channel lists are not so much as read. Tied means two gates, the
- * second nested in the first:
+ * The audience belongs to a GROUP, not to a survey: a group is either tied to
+ * the connected Discord server or it is not. Not tied - the default - means
+ * truly anonymous: no sign-in, no Discord call, and the role and channel lists
+ * are not so much as read. Tied means two gates, the second nested in the
+ * first:
  *
  *   1. the respondent signed in with Discord and is a member of the server;
- *   2. if the survey also names roles or channels, they match - any one of the
+ *   2. if the group also names roles or channels, they match - any one of the
  *      roles, any one of the channels, and both lists when both are populated.
  *
- * Only after both does the survey open.
+ * Only after both does the group admit somebody.
+ *
+ * A survey belongs to one or more groups, and satisfying ANY ONE of them opens
+ * it. So a survey placed on Astro, Gaming and a wide-open Public group is
+ * takeable by anyone, while the same survey on Astro and Gaming alone is
+ * takeable by whoever qualifies under either.
  *
  * Everything that would touch Discord is injected rather than imported, so
  * every branch is unit-testable on its own - not least the one that must never
@@ -28,15 +34,33 @@ export const ACCESS = {
 };
 
 /**
- * Whether a survey is gated on guild membership at all.
+ * Whether an audience is gated on guild membership at all.
  *
- * The single question every caller asks first: a false answer means the survey
- * behaves exactly as it did before this feature existed.
+ * The single question every caller asks first: a false answer means this
+ * audience behaves exactly as it did before the feature existed.
  *
- * @param {{require_guild?: boolean}} survey Survey row.
+ * @param {{require_guild?: boolean}} audience A group's audience rules.
  * @returns {boolean} True when the guild gate applies.
  */
-export const requiresGuild = (survey) => Boolean(survey?.require_guild);
+export const requiresGuild = (audience) => Boolean(audience?.require_guild);
+
+/**
+ * Whether every way into a survey goes through Discord.
+ *
+ * Not the same question as "is any group gated". A survey with one gated group
+ * and one open one is still takeable anonymously through the open one, so it
+ * cannot count its respondents by Discord account - some of them will not have
+ * one. Only when there is no anonymous way in at all does the survey know who
+ * is answering, which is what `respondentIdentity` keys on.
+ *
+ * A survey with no groups is not gated by this measure; it is not takeable at
+ * all, which `resolveGroupAccess` settles separately.
+ *
+ * @param {Array<{require_guild?: boolean}>} audiences The survey's groups.
+ * @returns {boolean} True when every group requires the guild.
+ */
+export const everyGroupRequiresGuild = (audiences) =>
+  Array.isArray(audiences) && audiences.length > 0 && audiences.every(requiresGuild);
 
 /**
  * Turns a refusal into what the participant is actually told.
@@ -74,11 +98,11 @@ export function refusal(outcome, guildName = null) {
 }
 
 /**
- * Decides whether the caller may open a survey.
+ * Decides whether the caller satisfies one group's audience.
  *
  * @param {object} request
- * @param {object} request.survey Survey row, for `require_guild`,
- *   `gate_role_ids` and `gate_channel_ids`.
+ * @param {object} request.audience A group's `require_guild`, `gate_role_ids`
+ *   and `gate_channel_ids`.
  * @param {boolean} request.pluginReady Whether the discord plugin is enabled
  *   with a server connected.
  * @param {string|null} request.discordId The Discord identity behind this
@@ -91,15 +115,15 @@ export function refusal(outcome, guildName = null) {
  *   discord.canSeeChannel Whether the member can view one channel.
  * @returns {Promise<string>} An ACCESS value.
  */
-export async function resolveAccess({ survey, pluginReady, discordId }, discord) {
-  // An anonymous survey returns before `discord` is so much as read. This is
-  // the promise the checkbox makes, and it is kept here rather than at each
-  // call site.
-  if (!requiresGuild(survey)) return ACCESS.OPEN;
+export async function resolveAccess({ audience, pluginReady, discordId }, discord) {
+  // An open group returns before `discord` is so much as read. This is the
+  // promise the checkbox makes, and it is kept here rather than at each call
+  // site.
+  if (!requiresGuild(audience)) return ACCESS.OPEN;
 
-  // A gated survey with no working Discord behind it fails closed. It is never
-  // downgraded to anonymous: the survey was published on the understanding
-  // that only the server could answer it.
+  // A gated group with no working Discord behind it fails closed. It is never
+  // downgraded to anonymous: its surveys were published on the understanding
+  // that only the server could answer them.
   if (!pluginReady) return ACCESS.UNAVAILABLE;
   if (!discordId) return ACCESS.SIGN_IN_REQUIRED;
 
@@ -115,8 +139,8 @@ export async function resolveAccess({ survey, pluginReady, discordId }, discord)
 
   // Gate 2: narrowing. Empty lists mean anyone in the server, which is the
   // whole point of gate 1 standing on its own.
-  const roleIds = survey.gate_role_ids ?? [];
-  const channelIds = survey.gate_channel_ids ?? [];
+  const roleIds = audience.gate_role_ids ?? [];
+  const channelIds = audience.gate_channel_ids ?? [];
   if (roleIds.length === 0 && channelIds.length === 0) return ACCESS.OPEN;
 
   // Each populated list is a requirement in its own right, and every
@@ -145,4 +169,57 @@ export async function resolveAccess({ survey, pluginReady, discordId }, discord)
   }
 
   return ACCESS.OPEN;
+}
+
+/**
+ * Which refusal is reported when no group admits the caller.
+ *
+ * Ordered by how much the person can do about it. Being asked to sign in comes
+ * first, because it is the one refusal that may turn into access. An outage
+ * comes next, so a Discord hiccup reads as "try again shortly" rather than as a
+ * verdict on the account. Only then the two settled refusals, joining the
+ * server before qualifying within it, which is the order somebody would act in.
+ */
+const REFUSAL_ORDER = [
+  ACCESS.SIGN_IN_REQUIRED,
+  ACCESS.UNAVAILABLE,
+  ACCESS.NOT_A_MEMBER,
+  ACCESS.NARROWED_OUT,
+];
+
+/**
+ * Decides whether the caller may open a survey, across all of its groups.
+ *
+ * Satisfying any one group is enough. Open groups are evaluated first so a
+ * survey that anybody can take costs no Discord call at all, however many gated
+ * groups it also belongs to, and the first group that admits the caller ends
+ * the search.
+ *
+ * A survey with no groups admits nobody. The API keeps that from happening, and
+ * this fails closed rather than treating "no rules" as "no restrictions".
+ *
+ * @param {object} request
+ * @param {Array<object>} request.audiences The audience rules of every group
+ *   the survey belongs to.
+ * @param {boolean} request.pluginReady Whether the discord plugin is enabled
+ *   with a server connected.
+ * @param {string|null} request.discordId The Discord identity behind this
+ *   request.
+ * @param {object} discord Injected Discord lookups, as `resolveAccess` takes.
+ * @returns {Promise<string>} An ACCESS value.
+ */
+export async function resolveGroupAccess({ audiences, pluginReady, discordId }, discord) {
+  const groups = Array.isArray(audiences) ? audiences : [];
+  if (groups.length === 0) return ACCESS.NARROWED_OUT;
+
+  const ordered = [...groups].sort((a, b) => Number(requiresGuild(a)) - Number(requiresGuild(b)));
+
+  const outcomes = new Set();
+  for (const audience of ordered) {
+    const outcome = await resolveAccess({ audience, pluginReady, discordId }, discord);
+    if (outcome === ACCESS.OPEN) return ACCESS.OPEN;
+    outcomes.add(outcome);
+  }
+
+  return REFUSAL_ORDER.find((outcome) => outcomes.has(outcome)) ?? ACCESS.NARROWED_OUT;
 }

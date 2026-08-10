@@ -56,6 +56,11 @@ export function DiscordSettings() {
   });
   const [adminRoleIds, setAdminRoleIds] = useState([]);
   const [adminChannelIds, setAdminChannelIds] = useState([]);
+  // Which group an account granted by one of those roles or channels resolves
+  // against. Nobody creates those accounts, so nobody would otherwise pick a
+  // group for them, and there is no default group left to fall back on.
+  const [adminGroupId, setAdminGroupId] = useState('');
+  const [groups, setGroups] = useState([]);
   const [tested, setTested] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
@@ -76,6 +81,8 @@ export function DiscordSettings() {
         setConfigured(data.configured);
         setMeta({ roles: data.roles ?? [], channels: data.channels ?? [] });
         setGuildName(data.guild?.name ?? null);
+        setGroups(data.groups ?? []);
+        setAdminGroupId(data.adminGroupId ?? '');
         if (data.values) {
           setValues({
             clientId: data.values.clientId ?? '',
@@ -134,7 +141,7 @@ export function DiscordSettings() {
     try {
       const result = await api('/plugin/discord/settings', {
         method: 'POST',
-        body: { ...values, adminRoleIds, adminChannelIds },
+        body: { ...values, adminRoleIds, adminChannelIds, adminGroupId: adminGroupId || null },
       });
       setSaved(result);
       setConfigured(true);
@@ -316,10 +323,39 @@ export function DiscordSettings() {
               </select>
             </label>
 
+            {/* Nobody creates these accounts: the tier is resolved per request
+                from the role or channel, so nobody ever picks a group for them
+                either. There is no default group to fall back on, so this is
+                where they get one - or they get nothing. */}
+            <label>
+              <span className="field-label">Group these admins belong to</span>
+              <select
+                value={adminGroupId}
+                onChange={(e) => setAdminGroupId(e.target.value)}
+                style={{ minWidth: '12rem' }}
+              >
+                <option value="">No group - they get no access</option>
+                {groups.map((group) => (
+                  <option key={group.id} value={group.id}>
+                    {group.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+
             <p className="muted" style={{ fontSize: '0.82rem' }}>
-              Anyone with one of these roles, or who can see one of these channels, gets admin access
-              with every permission. They do <strong>not</strong> become super administrators.
+              Anyone with one of these roles, or who can see one of these channels, gets the
+              administrator tier. They do <strong>not</strong> become super administrators. What
+              they can actually do comes from the group above, exactly as it does for anybody else.
             </p>
+            {/* Only worth saying once a role or channel actually grants
+                something: with both lists empty there is nobody to strand. */}
+            {!adminGroupId && (adminRoleIds.length > 0 || adminChannelIds.length > 0) ? (
+              <div className="error">
+                No group is chosen, so anyone granted admin by these roles or channels reaches the
+                panel and can do nothing in it. Pick a group above, or clear the lists.
+              </div>
+            ) : null}
           </div>
         );
       })()}

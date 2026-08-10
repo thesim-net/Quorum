@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api.js';
+import { AudienceFields } from '../components/AudienceFields.jsx';
+import { groupCountLine } from '../lib/groupCounts.js';
 import {
   findGrant,
   grantTargets,
@@ -15,10 +17,16 @@ import {
  * changes the pane beside it, so the page never shows more than one group's
  * controls at a time.
  *
- * @param {{groups: object[], selectedId: string, onSelect: (id: string) => void}} props
+ * The line under each name is three populations kept apart - the people in the
+ * group, the people who run it, and the super administrators who reach it
+ * without belonging to it. See lib/groupCounts.js for why they are never one
+ * number.
+ *
+ * @param {{groups: object[], selectedId: string, superAdminCount: number,
+ *   onSelect: (id: string) => void}} props
  * @returns {JSX.Element} The list.
  */
-function GroupList({ groups, selectedId, onSelect }) {
+function GroupList({ groups, selectedId, superAdminCount, onSelect }) {
   return (
     <ul className="pick-list">
       {groups.map((group) => {
@@ -39,8 +47,7 @@ function GroupList({ groups, selectedId, onSelect }) {
               <span className="pick-body">
                 <span className="pick-name">{group.name}</span>
                 <span className="pick-meta">
-                  {group.members.length} member{group.members.length === 1 ? '' : 's'}
-                  {group.isDefault ? ' · Default' : ''}
+                  {groupCountLine(group.members, superAdminCount)}
                 </span>
               </span>
             </button>
@@ -59,9 +66,11 @@ function GroupList({ groups, selectedId, onSelect }) {
  * rather than carrying a half-typed rename across.
  *
  * @param {{group: object, admins: object[], catalogue: object[], busy: boolean,
- *   canManageGroups: boolean,
- *   onRename: (name: string) => void, onMakeDefault: () => void,
+ *   canManageGroups: boolean, discord: object, serverName: string,
+ *   guild: {roles: object[], channels: object[]},
+ *   onRename: (name: string) => void,
  *   onDelete: () => void, onTogglePermission: (key: string) => void,
+ *   onSetAudience: (patch: object) => void,
  *   onAddMember: (userId: string, isAdmin: boolean) => Promise<void>,
  *   onSetMemberAdmin: (member: object, isAdmin: boolean) => void,
  *   onRemoveMember: (member: object) => void}} props
@@ -73,10 +82,13 @@ function GroupDetail({
   catalogue,
   busy,
   canManageGroups,
+  discord,
+  serverName,
+  guild,
   onRename,
-  onMakeDefault,
   onDelete,
   onTogglePermission,
+  onSetAudience,
   onAddMember,
   onSetMemberAdmin,
   onRemoveMember,
@@ -99,14 +111,8 @@ function GroupDetail({
         <h3 id="group-detail-name" style={{ margin: 0 }}>
           {group.name}
         </h3>
-        {group.isDefault ? <span className="badge">Default</span> : null}
         <span style={{ marginLeft: 'auto' }} />
-        {canManageGroups && !group.isDefault ? (
-          <button type="button" onClick={onMakeDefault} disabled={busy}>
-            Make default
-          </button>
-        ) : null}
-        {canManageGroups && !group.isDefault ? (
+        {canManageGroups ? (
           <button type="button" className="danger" onClick={() => setConfirming(true)}>
             Delete
           </button>
@@ -159,6 +165,22 @@ function GroupDetail({
           </span>
         </label>
       ))}
+
+      <h4>Who can take our surveys</h4>
+      <p className="muted" style={{ fontSize: '0.82rem', marginTop: 0 }}>
+        Applies to every survey this group owns. A survey placed in more than one group can be
+        taken by anyone who qualifies under any one of them.
+        {canManageGroups ? '' : ' Only a super administrator can change this.'}
+      </p>
+      <AudienceFields
+        groupName={group.name}
+        value={group}
+        onChange={onSetAudience}
+        discord={guild}
+        ready={Boolean(discord?.ready)}
+        serverName={serverName}
+        disabled={busy || !canManageGroups}
+      />
 
       <h4>Members</h4>
       {group.members.length === 0 ? (
@@ -225,10 +247,12 @@ function GroupDetail({
           <option value="">
             {assignable.length === 0 ? 'Every admin is already a member' : 'Add an admin...'}
           </option>
+          {/* Super administrators are not offered: they reach every group
+              already, so the server refuses the membership rather than
+              creating one that grants nothing and implies otherwise. */}
           {assignable.map((admin) => (
             <option key={admin.id} value={admin.id}>
               {admin.displayName || admin.username}
-              {admin.tier === 'super_admin' ? ' (super)' : ''}
             </option>
           ))}
         </select>
@@ -260,13 +284,6 @@ function GroupDetail({
           </span>
         </span>
       </label>
-      {group.members.some((member) => member.tier === 'super_admin') ? (
-        <p className="muted" style={{ fontSize: '0.8rem' }}>
-          Super administrators already have every permission everywhere; membership does not change
-          what they can do.
-        </p>
-      ) : null}
-
       {removing ? (
         <div className="confirm">
           <h3>Remove {removing.displayName || removing.username} from {group.name}?</h3>
@@ -278,6 +295,10 @@ function GroupDetail({
             <li>
               Their account is kept, along with every other group they are in. This removes the
               membership only.
+            </li>
+            <li>
+              If this is the only group they are in, the removal is refused: an administrator in no
+              group has no access at all.
             </li>
           </ul>
           <div className="row">
@@ -304,7 +325,8 @@ function GroupDetail({
         <div className="confirm">
           <h3>Delete this group?</h3>
           <p>
-            Its surveys will be reassigned to the default group, and its members and grants removed.
+            Its members and grants are removed, and its surveys lose it. A survey that belongs to
+            this group and no other blocks the delete, because a survey must always have a group.
             This cannot be undone.
           </p>
           <div className="row">
@@ -374,15 +396,17 @@ function GrantList({ rows, catalogue, busy, onEdit, onRemove }) {
 /**
  * Group management.
  *
- * A group decides what its members may do to its own surveys, and can be given
- * permissions over another group's surveys. The default group is renamable but
- * cannot be deleted, and there is always exactly one.
+ * A group decides three things: what its members may do to its own surveys, who
+ * may TAKE its surveys, and which other groups may reach into it. The second one
+ * used to sit on each survey; it belongs here, because a group is a set of
+ * people and the surveys run for them.
  *
  * Two audiences. A super admin shapes the groups themselves: creating them,
- * renaming them, deciding what their members may do, and granting one group
- * access to another. An administrator of a group runs that group's membership
- * and only that: the server sends them their own groups alone, and everything
- * outside membership is read-only here as well as refused there.
+ * renaming them, deciding what their members may do and who may take their
+ * surveys, and granting one group access to another. An administrator of a
+ * group runs that group's membership and only that: the server sends them their
+ * own groups alone, and everything outside membership is read-only here as well
+ * as refused there.
  *
  * The page is two sections, each reading left to right. The first picks one
  * group and shows only that group's controls; the second is a single sentence
@@ -404,10 +428,22 @@ export function AdminGroups() {
   const [error, setError] = useState(null);
   const [status, setStatus] = useState(null);
   const [busy, setBusy] = useState(false);
+  // The connected server's roles and channels, for the audience section. Only
+  // fetched when there is a server and the caller can actually change it.
+  const [guild, setGuild] = useState({ guild: null, roles: [], channels: [] });
 
   const load = () =>
     api('/admin/groups')
-      .then(setData)
+      .then((next) => {
+        setData(next);
+        if (next.discord?.ready && next.canManageGroups) {
+          // The gate card explains itself without these, and never waits on
+          // Discord to render.
+          api('/plugin/discord/guild')
+            .then(setGuild)
+            .catch(() => setGuild({ guild: null, roles: [], channels: [] }));
+        }
+      })
       .catch((e) => setError(e.message));
 
   useEffect(() => {
@@ -445,13 +481,13 @@ export function AdminGroups() {
 
   const { groups, admins, catalogue } = data;
   const canManageGroups = Boolean(data.canManageGroups);
+  const superAdminCount = data.superAdminCount ?? 0;
+  // The real server name wherever it is known, and generic wording when it is
+  // not: naming it is worth having, but never worth blocking the page for.
+  const serverName = guild.guild?.name || data.discord?.guildName || 'the connected Discord server';
   // The selection is derived rather than stored, so deleting the selected group
-  // falls back to the default instead of leaving the pane pointing at nothing.
-  const selected =
-    groups.find((group) => group.id === selectedId) ??
-    groups.find((group) => group.isDefault) ??
-    groups[0] ??
-    null;
+  // falls back to the first instead of leaving the pane pointing at nothing.
+  const selected = groups.find((group) => group.id === selectedId) ?? groups[0] ?? null;
 
   const existing = findGrant(groups, grant.sourceId, grant.targetId);
   const grantRows = listGrants(groups);
@@ -473,10 +509,17 @@ export function AdminGroups() {
     run(() => api(`/admin/groups/${selected.id}`, { method: 'PATCH', body: { name: next } }),
       'Group renamed.');
 
-  /** Makes the selected group the default. */
-  const makeDefault = () =>
-    run(() => api(`/admin/groups/${selected.id}`, { method: 'PATCH', body: { isDefault: true } }),
-      `${selected.name} is now the default group.`);
+  /**
+   * Changes who may take the selected group's surveys.
+   *
+   * Saved immediately, like everything else here: the audience governs live
+   * surveys, so leaving it half-applied in the page would be worse than a
+   * round trip.
+   *
+   * @param {object} patch One of requireGuild, gateRoleIds, gateChannelIds.
+   */
+  const setAudience = (patch) =>
+    run(() => api(`/admin/groups/${selected.id}`, { method: 'PATCH', body: patch }));
 
   /**
    * Toggles one of the selected group's member permissions.
@@ -534,7 +577,7 @@ export function AdminGroups() {
       `${member.displayName || member.username} is no longer in ${selected.name}.`,
     );
 
-  /** Deletes the selected group, reassigning its surveys to the default. */
+  /** Deletes the selected group, unless a survey would be left with none. */
   const destroy = () => {
     const removedId = selected.id;
     return run(async () => {
@@ -614,9 +657,9 @@ export function AdminGroups() {
     <div className="shell">
       <h1>Groups</h1>
       <p className="muted">
-        A group decides what its members can do to its own surveys, and can be granted access to
-        another group&rsquo;s surveys. Membership is explicit and works the same with or without
-        Discord.
+        A group decides what its members can do to its own surveys, who can take them, and can be
+        granted access to another group&rsquo;s surveys. Membership is explicit and works the same
+        with or without Discord. Super administrators reach every group without belonging to any.
         {canManageGroups
           ? ''
           : ' You are shown the groups you administer: their membership is yours to run, and the rest is a super administrator’s.'}
@@ -633,7 +676,12 @@ export function AdminGroups() {
 
         <div className="split">
           <div className="split-side">
-            <GroupList groups={groups} selectedId={selected?.id} onSelect={setSelectedId} />
+            <GroupList
+              groups={groups}
+              selectedId={selected?.id}
+              superAdminCount={superAdminCount}
+              onSelect={setSelectedId}
+            />
             {canManageGroups ? (
               <div className="row" style={{ marginTop: '0.75rem' }}>
                 <input
@@ -660,10 +708,13 @@ export function AdminGroups() {
               catalogue={catalogue}
               busy={busy}
               canManageGroups={canManageGroups}
+              discord={data.discord}
+              serverName={serverName}
+              guild={guild}
               onRename={rename}
-              onMakeDefault={makeDefault}
               onDelete={destroy}
               onTogglePermission={toggleMemberPermission}
+              onSetAudience={setAudience}
               onAddMember={addMember}
               onSetMemberAdmin={setMemberAdmin}
               onRemoveMember={removeMember}

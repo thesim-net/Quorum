@@ -7,7 +7,10 @@ import { removalConsequences } from '../lib/removal.js';
  * Admin access management.
  *
  * An admin account is a standing and a set of groups. Super administrators are
- * unrestricted and bypass groups; everybody else does what their groups allow.
+ * unrestricted and bypass groups entirely - they hold no membership at all, and
+ * one cannot be given to them. Everybody else does what their groups allow, and
+ * nothing without one: there is no default group behind an administrator who
+ * belongs to none, so a group is chosen here or the account is not created.
  * One of those memberships may also administer its group, which is a property
  * of that membership: an administrator of Selections who also belongs to Astro
  * administers Selections alone.
@@ -47,13 +50,16 @@ export function AdminUsers() {
         setData(next);
         // The groups offered are the ones the caller may invite into: every
         // group for a super admin, and only their own for an administrator of
-        // one. Re-derived on each load so a group that has gone away does not
-        // leave the field pointing at nothing.
-        setGroupId((current) =>
-          next.groups?.some((group) => group.id === current)
-            ? current
-            : next.groups?.[0]?.id ?? '',
-        );
+        // one. Nothing is preselected where there is a choice - picking one is
+        // the decision, and a preselection would make the commonest choice the
+        // one nobody looked at. The single exception is an administrator of
+        // exactly one group, for whom there is no choice to make and the page
+        // states the group rather than offering it.
+        const offered = next.groups ?? [];
+        setGroupId((current) => {
+          if (offered.some((group) => group.id === current)) return current;
+          return !next.canManage && offered.length === 1 ? offered[0].id : '';
+        });
       })
       .catch((e) => setError(e.message));
 
@@ -68,8 +74,10 @@ export function AdminUsers() {
     setStatus(null);
     setOneTime(null);
     try {
-      // Super admins bypass groups, so one is never sent for them. The two
-      // standings are exclusive; the server refuses both regardless.
+      // Super admins bypass groups, so one is never sent for them - the server
+      // refuses a body carrying both rather than creating a membership it would
+      // then have to delete. For everybody else the group is mandatory, and the
+      // server refuses a body without one.
       const body = {
         superAdmin,
         groupAdmin,
@@ -110,7 +118,10 @@ export function AdminUsers() {
     try {
       await api(`/admin/admins/${admin.id}`, {
         method: 'PATCH',
-        body: { superAdmin: editing.superAdmin },
+        // Coming down from super administrator lands them in no group at all,
+        // which is no access at all, so a destination is sent with it. The
+        // server refuses the demotion without one either way.
+        body: { superAdmin: editing.superAdmin, groupId: editing.groupId || null },
       });
       setEditing(null);
       setStatus(`Updated ${admin.username}.`);
@@ -204,10 +215,16 @@ export function AdminUsers() {
   const discordOn = Boolean(data.plugins?.discord);
   const twofactorOn = Boolean(data.plugins?.twofactor);
   const groups = data.groups ?? [];
-  const defaultGroupName = groups.find((group) => group.isDefault)?.name ?? 'the default group';
+  // Where a Discord role or channel lands somebody, when the plugin has been
+  // told. Null means those accounts get no access at all, which the rows below
+  // say outright rather than implying a default that no longer exists.
+  const derivedGroup = data.discordAdminGroup ?? null;
   // A single group is not a choice, so it is stated rather than selected: the
   // page has to read as "you are inviting somebody into <group>".
   const fixedGroup = !canManage && groups.length === 1 ? groups[0] : null;
+  // A group is mandatory for anybody but a super administrator, so the Add
+  // button waits for one rather than letting the server refuse the round trip.
+  const groupMissing = !superAdmin && !groupId;
 
   return (
     <div className="card">
@@ -280,7 +297,11 @@ export function AdminUsers() {
               type="button"
               className="primary"
               onClick={add}
-              disabled={busy || (mode === 'discord' && discordOn ? !discordId.trim() : !username.trim())}
+              disabled={
+                busy ||
+                groupMissing ||
+                (mode === 'discord' && discordOn ? !discordId.trim() : !username.trim())
+              }
             >
               {busy ? 'Adding...' : 'Add'}
             </button>
@@ -325,11 +346,17 @@ export function AdminUsers() {
           </label>
 
           {/* A plain admin can do whatever their group can do, so the group is
-              the whole of the decision. Super admins bypass groups, so it is
-              not offered for them. */}
-          {superAdmin || groups.length === 0 ? null : (
+              the whole of the decision - and required, because an administrator
+              in no group can do nothing at all. Super admins bypass groups, so
+              it is not offered for them. */}
+          {superAdmin ? null : (
             <div style={{ marginLeft: '1.6rem' }}>
-              {fixedGroup ? (
+              {groups.length === 0 ? (
+                <div className="error">
+                  There is no group to put them in, and an administrator in no group has no access
+                  at all. Create a group on the <Link to="/admin/groups">Groups</Link> page first.
+                </div>
+              ) : fixedGroup ? (
                 <p style={{ margin: '0 0 0.25rem' }}>
                   <span className="field-label">Group</span>
                   <br />
@@ -339,7 +366,7 @@ export function AdminUsers() {
                 <>
                   <label htmlFor="new-admin-group" style={{ marginBottom: '0.25rem' }}>
                     <span className="field-label">
-                      {canManage ? 'Group' : 'Group you are inviting them into'}
+                      {canManage ? 'Group (required)' : 'Group you are inviting them into'}
                     </span>
                   </label>
                   <select
@@ -348,17 +375,18 @@ export function AdminUsers() {
                     onChange={(e) => setGroupId(e.target.value)}
                     style={{ minWidth: '12rem' }}
                   >
+                    <option value="">Choose a group...</option>
                     {groups.map((group) => (
                       <option key={group.id} value={group.id}>
                         {group.name}
-                        {group.isDefault && canManage ? ' (default)' : ''}
                       </option>
                     ))}
                   </select>
                 </>
               )}
               <p className="muted" style={{ fontSize: '0.8rem' }}>
-                What they can do is whatever this group can do to its own surveys. Membership is
+                What they can do is whatever this group can do to its own surveys, and an
+                administrator in no group can do nothing, so one has to be chosen. Membership is
                 changed on the <Link to="/admin/groups">Groups</Link> page.
               </p>
             </div>
@@ -425,12 +453,13 @@ export function AdminUsers() {
                       </>
                     ) : null}
                     <span className="muted" style={{ fontSize: '0.82rem' }}>
-                      {/* Membership is the access. An admin in no group falls
-                          back to the default one, said outright rather than
-                          shown as a blank. */}
+                      {/* Membership IS the access. There is no default group
+                          behind an admin who belongs to none, so "no group"
+                          means no access - said outright rather than shown as
+                          a blank that reads like an oversight. */}
                       {admin.groups.length > 0
                         ? `In ${admin.groups.map((group) => group.name).join(', ')}`
-                        : `No group - ${defaultGroupName} applies`}
+                        : 'No group, so no access. Add them to one on the Groups page.'}
                     </span>
                   </>
                 )}
@@ -463,8 +492,10 @@ export function AdminUsers() {
                               ? null
                               : {
                                   id: admin.id,
+                                  wasSuperAdmin: admin.tier === 'super_admin',
                                   superAdmin: admin.tier === 'super_admin',
                                   administers: admin.administers,
+                                  groupId: '',
                                 },
                           )
                         }
@@ -511,37 +542,47 @@ export function AdminUsers() {
             </Fragment>
           ))}
 
-          {data.adminRoles.map((role) => (
-            <tr key={role.id}>
+          {/* Nobody creates these accounts and nobody picks a group for them:
+              the tier comes from a Discord role or channel, resolved per
+              request. The Discord plugin names the group they resolve against,
+              and with none named they have no access - which is what these rows
+              have to say, since there is no default group behind them. */}
+          {[
+            ...data.adminRoles.map((role) => ({
+              key: `role-${role.id}`,
+              who: (
+                <>
+                  Anyone with <strong>{role.name}</strong>
+                </>
+              ),
+              source: 'Discord role',
+            })),
+            ...data.adminChannels.map((channel) => ({
+              key: `channel-${channel.id}`,
+              who: (
+                <>
+                  Anyone who can see <strong>#{channel.name}</strong>
+                </>
+              ),
+              source: 'Discord channel',
+            })),
+          ].map((entry) => (
+            <tr key={entry.key}>
               <th scope="row" style={{ display: 'table-cell' }}>
-                Anyone with <strong>{role.name}</strong>
+                {entry.who}
               </th>
               <td>
                 <span className="muted" style={{ fontSize: '0.82rem' }}>
-                  Discord role - administrator, not super admin
+                  {entry.source} - administrator, not super admin
                   <br />
-                  In no group, so {defaultGroupName} applies until they are added to one.
-                  {canManage ? (
+                  {derivedGroup ? (
+                    <>Resolved against <strong>{derivedGroup.name}</strong>.</>
+                  ) : (
                     <>
-                      <br />
-                      Change this in the Discord plugin settings.
+                      No group is set for Discord-granted admins, so they have no access at all.
+                      Set one in the Discord plugin settings.
                     </>
-                  ) : null}
-                </span>
-              </td>
-            </tr>
-          ))}
-
-          {data.adminChannels.map((channel) => (
-            <tr key={channel.id}>
-              <th scope="row" style={{ display: 'table-cell' }}>
-                Anyone who can see <strong>#{channel.name}</strong>
-              </th>
-              <td>
-                <span className="muted" style={{ fontSize: '0.82rem' }}>
-                  Discord channel - administrator, not super admin
-                  <br />
-                  In no group, so {defaultGroupName} applies until they are added to one.
+                  )}
                   {canManage ? (
                     <>
                       <br />
@@ -613,10 +654,39 @@ export function AdminUsers() {
               <span className="muted" style={{ fontSize: '0.82rem' }}>
                 {editing.administers.length > 0
                   ? `They administer ${editing.administers.join(', ')}. Clear that on the Groups page first: a super administrator bypasses groups.`
-                  : 'The only standing held by the account itself. Everything else follows from its groups.'}
+                  : 'The only standing held by the account itself. Everything else follows from its groups. Granting it clears every group they belong to, since a super administrator reaches all of them anyway.'}
               </span>
             </span>
           </label>
+
+          {/* A super administrator holds no memberships, so demoting one leaves
+              them in no group - which is no access at all. Where they land is
+              part of the demotion rather than something to fix afterwards. */}
+          {editing.wasSuperAdmin && !editing.superAdmin ? (
+            <div style={{ marginLeft: '1.6rem' }}>
+              <label htmlFor="demote-group" style={{ marginBottom: '0.25rem' }}>
+                <span className="field-label">Group they will belong to (required)</span>
+              </label>
+              <select
+                id="demote-group"
+                value={editing.groupId}
+                onChange={(e) => setEditing({ ...editing, groupId: e.target.value })}
+                style={{ minWidth: '12rem' }}
+              >
+                <option value="">Choose a group...</option>
+                {groups.map((group) => (
+                  <option key={group.id} value={group.id}>
+                    {group.name}
+                  </option>
+                ))}
+              </select>
+              <p className="muted" style={{ fontSize: '0.8rem' }}>
+                They hold no group membership as a super administrator, so without one they would
+                reach the panel and be able to do nothing in it.
+              </p>
+            </div>
+          ) : null}
+
           <div className="row">
             <button type="button" onClick={() => setEditing(null)}>
               Cancel
@@ -624,6 +694,7 @@ export function AdminUsers() {
             <button
               type="button"
               className="primary"
+              disabled={editing.wasSuperAdmin && !editing.superAdmin && !editing.groupId}
               onClick={() => save(data.granted.find((a) => a.id === editing.id))}
             >
               Save
