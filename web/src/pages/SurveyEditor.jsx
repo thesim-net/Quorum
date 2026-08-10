@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api.js';
+import { Toggle } from '../components/Toggle.jsx';
 
 const TYPES = [
   ['short_text', 'Short text'],
@@ -58,28 +59,29 @@ function formatWhen(iso) {
 }
 
 /**
- * A labelled checkbox.
+ * How one of a survey's groups narrows who may take it.
  *
- * @param {{checked: boolean, onChange: (v: boolean) => void, label: string,
- *   hint?: string}} props
- * @returns {JSX.Element} The toggle.
+ * Read-only here on purpose. The audience belongs to the group, so this says
+ * what each group admits and points at where to change it, rather than offering
+ * a second place to set it that could disagree with the first.
+ *
+ * @param {{group: object, serverName: string}} props
+ * @returns {string} A sentence fragment describing the group's audience.
  */
-const Toggle = ({ checked, onChange, label, hint }) => (
-  <label className="option-row" style={{ alignItems: 'flex-start' }}>
-    <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
-    <span>
-      {label}
-      {hint ? (
-        <>
-          <br />
-          <span className="muted" style={{ fontSize: '0.82rem' }}>
-            {hint}
-          </span>
-        </>
-      ) : null}
-    </span>
-  </label>
-);
+function audienceOf(group, serverName) {
+  if (!group.requireGuild) return 'anyone with the link';
+
+  const parts = [];
+  if (group.roleCount > 0) {
+    parts.push(`${group.roleCount} role${group.roleCount === 1 ? '' : 's'}`);
+  }
+  if (group.channelCount > 0) {
+    parts.push(`${group.channelCount} channel${group.channelCount === 1 ? '' : 's'}`);
+  }
+
+  const base = `members of ${serverName}`;
+  return parts.length === 0 ? base : `${base}, narrowed by ${parts.join(' and ')}`;
+}
 
 /**
  * Editor for a single question.
@@ -454,9 +456,13 @@ export function SurveyEditor() {
   const [questions, setQuestions] = useState([]);
   const [discord, setDiscord] = useState({ guild: null, roles: [], channels: [] });
   // Whether a Discord server is connected at all, and what it is called. Comes
-  // with the survey so the gate section can render before - or without - the
-  // roles and channels arriving.
+  // with the survey so the audience summary can render before - or without -
+  // the roles and channels arriving.
   const [server, setServer] = useState({ ready: false, guildName: null });
+  // The groups this survey belongs to, with the audience each one carries, and
+  // the groups the caller could move it into.
+  const [groups, setGroups] = useState([]);
+  const [assignable, setAssignable] = useState([]);
   const [plugins, setPlugins] = useState({});
   const [responses, setResponses] = useState(null);
   const [pendingLoss, setPendingLoss] = useState(null);
@@ -505,10 +511,12 @@ export function SurveyEditor() {
         setResponses(data.responses);
         setPlugins(data.plugins ?? {});
         setServer(data.discord ?? { ready: false, guildName: null });
+        setGroups(data.groups ?? []);
+        setAssignable(data.assignableGroups ?? []);
 
         // Roles and channels come from the discord plugin, so they are only
-        // asked for when a server is connected; the gate card explains itself
-        // otherwise, and never waits on this to render.
+        // asked for when a server is connected; the announcement channel picker
+        // is the only thing left here that wants them.
         if (data.discord?.ready) {
           api('/plugin/discord/guild')
             .then(setDiscord)
@@ -599,6 +607,8 @@ export function SurveyEditor() {
       setSurvey(fresh.survey);
       setQuestions(fresh.questions);
       setResponses(fresh.responses);
+      setGroups(fresh.groups ?? []);
+      setAssignable(fresh.assignableGroups ?? []);
       setSaved(true);
       setDirty(false);
     } catch (e) {
@@ -637,6 +647,17 @@ export function SurveyEditor() {
   // not: naming it is worth having, but never worth blocking the editor for.
   const serverName = discord.guild?.name || server.guildName || 'the connected Discord server';
 
+  // A survey can belong to a group this admin cannot create surveys in - one
+  // group's surveys.write covers the whole survey. That group is shown, so the
+  // picker never appears to have lost it, but it is not theirs to change.
+  const lockedGroupIds = groups
+    .filter((group) => !assignable.some((entry) => entry.id === group.id))
+    .map((group) => group.id);
+  const groupOptions = [
+    ...assignable,
+    ...groups.filter((group) => lockedGroupIds.includes(group.id)),
+  ];
+
   return (
     <div className="shell">
       <p>
@@ -674,8 +695,11 @@ export function SurveyEditor() {
           onChange={(oneResponsePerPerson) => patch({ oneResponsePerPerson })}
           label="Allow one response per person"
           hint={
-            survey.requireGuild
-              ? 'Counted per Discord account, since this survey knows who is answering.'
+            // Counted per Discord account only when every group requires it:
+            // one open group leaves an anonymous way in, and those respondents
+            // have no account to count.
+            groups.length > 0 && groups.every((group) => group.requireGuild)
+              ? 'Counted per Discord account, since every group this survey is for signs its respondents in.'
               : 'Counted per browser, which is all an anonymous survey can know. Switch it off to let the same person answer as often as they like.'
           }
         />
@@ -829,105 +853,77 @@ export function SurveyEditor() {
         </div>
       ) : null}
 
-      {server.ready ? (
       <div className="card">
-        <h2>Who can take it</h2>
+        <h2>Groups</h2>
+        <p className="muted" style={{ fontSize: '0.85rem' }}>
+          A survey belongs to at least one group, and every group it belongs to can see it and act
+          on it. Who may <strong>take</strong> it is each group&rsquo;s own decision: someone who
+          qualifies under any one of these groups can take it.
+        </p>
 
-        {/* One decision first - is this survey for the server or for anyone -
-            and only then the narrowing, so the two are never mistaken for
-            unrelated settings. */}
-        <Toggle
-          checked={!!survey.requireGuild}
-          onChange={(requireGuild) => patch({ requireGuild })}
-          label={`Only members of ${serverName} can take this survey`}
-          hint="Participants sign in with Discord and their membership is checked before the survey opens. Left off, the survey is truly anonymous: no sign-in, and Discord is never contacted."
-        />
+        <label>
+          <span className="field-label">Groups this survey is for</span>
+          <select
+            multiple
+            size={Math.min(8, Math.max(3, groupOptions.length))}
+            value={survey.groupIds ?? []}
+            onChange={(e) =>
+              patch({
+                // A group this admin cannot create surveys in is not theirs to
+                // add or drop, so it survives whatever the selection does. The
+                // server enforces the same thing.
+                groupIds: [
+                  ...new Set([
+                    ...[...e.target.selectedOptions].map((o) => o.value),
+                    ...lockedGroupIds,
+                  ]),
+                ],
+              })
+            }
+          >
+            {groupOptions.map((group) => (
+              <option key={group.id} value={group.id}>
+                {group.name}
+                {lockedGroupIds.includes(group.id) ? ' (not yours to change)' : ''}
+              </option>
+            ))}
+          </select>
+        </label>
 
-        {survey.requireGuild ? (
+        {(survey.groupIds?.length ?? 0) === 0 ? (
+          <div className="error">
+            Choose at least one group. A survey in no group can be taken by nobody and reached by
+            nobody.
+          </div>
+        ) : null}
+
+        {groups.length > 0 ? (
           <>
-            <p className="muted" style={{ fontSize: '0.85rem', marginTop: '1rem' }}>
-              Optionally narrow it further to who <strong>from {serverName}</strong> may take it.
-              Leave both lists empty and every member can.
+            <span className="field-label">Who each group admits</span>
+            <table className="chart-table">
+              <tbody>
+                {groups.map((group) => (
+                  <tr key={group.id}>
+                    <th scope="row" style={{ display: 'table-cell' }}>
+                      {group.name}
+                    </th>
+                    <td>
+                      <span className="muted" style={{ fontSize: '0.82rem' }}>
+                        {audienceOf(group, serverName)}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="muted" style={{ fontSize: '0.82rem' }}>
+              Change who can take a group&rsquo;s surveys on the{' '}
+              <Link to="/admin/groups">Groups</Link> page. It applies to every survey that group
+              owns, which is the point of it living there.
             </p>
-
-            <label>
-              <span className="field-label">Roles (any one of these)</span>
-              <select
-                multiple
-                size={Math.min(8, Math.max(3, discord.roles.length))}
-                value={survey.gateRoleIds ?? []}
-                onChange={(e) =>
-                  patch({ gateRoleIds: [...e.target.selectedOptions].map((o) => o.value) })
-                }
-              >
-                {discord.roles.map((role) => (
-                  <option key={role.id} value={role.id}>
-                    {role.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              <span className="field-label">Channels (can see any one of these)</span>
-              <select
-                multiple
-                size={Math.min(8, Math.max(3, discord.channels.length))}
-                value={survey.gateChannelIds ?? []}
-                onChange={(e) =>
-                  patch({ gateChannelIds: [...e.target.selectedOptions].map((o) => o.value) })
-                }
-              >
-                {discord.channels.map((channel) => (
-                  <option key={channel.id} value={channel.id}>
-                    #{channel.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            {/* Both lists populated is an AND, which is narrower than it looks
-                and the easiest way to lock everyone out. Say so plainly. */}
-            {(survey.gateRoleIds?.length ?? 0) > 0 &&
-            (survey.gateChannelIds?.length ?? 0) > 0 ? (
-              <div className="confirm">
-                <h3>Both requirements must be met</h3>
-                <p style={{ marginBottom: 0 }}>
-                  A member needs one of the {survey.gateRoleIds.length} selected role
-                  {survey.gateRoleIds.length === 1 ? '' : 's'} <strong>and</strong> must be able to
-                  see one of the {survey.gateChannelIds.length} selected channel
-                  {survey.gateChannelIds.length === 1 ? '' : 's'}. Anyone missing either is refused.
-                </p>
-              </div>
-            ) : null}
           </>
         ) : null}
       </div>
-      ) : (
-      <div className="card">
-        <h2>Who can take it</h2>
-        {survey.requireGuild ? (
-          // Gated, with nothing left to check it against. The toggle stays so
-          // this is a decision the admin can still reverse from here.
-          <>
-            <div className="error">
-              This survey is limited to the members of a Discord server, and no server is connected,
-              so nobody can take it. Connect one under Admin, Plugins, or turn the limit off here.
-            </div>
-            <Toggle
-              checked
-              onChange={(requireGuild) => patch({ requireGuild })}
-              label="Only members of a Discord server can take this survey"
-            />
-          </>
-        ) : (
-          <p className="muted" style={{ marginBottom: 0 }}>
-            Anyone with the link, anonymously. Limiting a survey to the members of a Discord server
-            needs the Discord Integration plugin enabled with a server connected.
-          </p>
-        )}
-      </div>
-      )}
 
       <h2>Questions</h2>
       {questions.map((question, index) => (

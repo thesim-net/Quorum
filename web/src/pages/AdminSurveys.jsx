@@ -45,6 +45,11 @@ const when = (iso) =>
 export function AdminSurveys() {
   const [surveys, setSurveys] = useState(null);
   const [title, setTitle] = useState('');
+  // The groups the caller may create in, and the ones they have picked. Nothing
+  // is preselected: there is no default group any more, so choosing is part of
+  // creating a survey rather than something that happens by omission.
+  const [groups, setGroups] = useState([]);
+  const [groupIds, setGroupIds] = useState([]);
   const [filter, setFilter] = useState('all');
   const [error, setError] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
@@ -84,7 +89,15 @@ export function AdminSurveys() {
    */
   const load = () =>
     api('/admin/surveys')
-      .then((data) => setSurveys(data.surveys))
+      .then((data) => {
+        setSurveys(data.surveys);
+        setGroups(data.groups ?? []);
+        // Drop any group that has gone away rather than leaving the selection
+        // pointing at nothing.
+        setGroupIds((current) =>
+          current.filter((id) => (data.groups ?? []).some((group) => group.id === id)),
+        );
+      })
       .catch((e) => setError(e.message));
 
   useEffect(() => {
@@ -92,17 +105,18 @@ export function AdminSurveys() {
     api('/admin/me').then(setMe).catch(() => setMe(null));
   }, []);
 
-  /** Creates a draft survey and opens it for editing. */
+  /** Creates a draft survey in the chosen groups and opens it for editing. */
   const create = async () => {
-    if (!title.trim()) return;
+    if (!title.trim() || groupIds.length === 0) return;
     setBusy(true);
     setError(null);
     try {
       const result = await api('/admin/surveys', {
         method: 'POST',
-        body: { title: title.trim() },
+        body: { title: title.trim(), groupIds },
       });
       setTitle('');
+      setGroupIds([]);
       // Straight into the editor: a survey with no questions is not useful yet.
       navigate(`/admin/surveys/${result.survey.id}`);
     } catch (e) {
@@ -190,10 +204,39 @@ export function AdminSurveys() {
               onKeyDown={(e) => e.key === 'Enter' && create()}
               style={{ flex: 1 }}
             />
-            <button type="button" className="primary" onClick={create} disabled={busy}>
+            <button
+              type="button"
+              className="primary"
+              onClick={create}
+              disabled={busy || !title.trim() || groupIds.length === 0}
+            >
               {busy ? 'Creating...' : 'Create survey'}
             </button>
           </div>
+
+          {/* Which groups the survey is for, and nothing preselected. Only the
+              groups this admin can create in are offered; the server checks it
+              again, per group. */}
+          <label>
+            <span className="field-label">Groups this survey is for</span>
+            <select
+              multiple
+              size={Math.min(6, Math.max(3, groups.length))}
+              value={groupIds}
+              onChange={(e) => setGroupIds([...e.target.selectedOptions].map((o) => o.value))}
+            >
+              {groups.map((group) => (
+                <option key={group.id} value={group.id}>
+                  {group.name}
+                </option>
+              ))}
+            </select>
+            <span className="muted" style={{ fontSize: '0.82rem' }}>
+              {groups.length === 0
+                ? 'You are not in a group that lets you create surveys. Ask a super administrator to add you to one.'
+                : 'Pick one or more. Each group decides who may take its surveys, so anyone who qualifies under any of them can take this one.'}
+            </span>
+          </label>
         </div>
       ) : null}
 
@@ -231,7 +274,13 @@ export function AdminSurveys() {
             {survey.collect.timing ? <span className="badge">Timing</span> : null}
             {survey.collect.location ? <span className="badge">Country</span> : null}
             {survey.gated ? <span className="badge">Restricted</span> : null}
-            {survey.groupName ? <span className="badge">{survey.groupName}</span> : null}
+            {/* Every group it belongs to, because each of them owns it and can
+                act on it. */}
+            {(survey.groups ?? []).map((group) => (
+              <span className="badge" key={group.id}>
+                {group.name}
+              </span>
+            ))}
           </div>
 
           <p className="muted">

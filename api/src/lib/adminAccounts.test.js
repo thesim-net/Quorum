@@ -4,6 +4,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  SUPER_ADMIN_NEEDS_NO_GROUP,
   administeredGroupIds,
   administersGroup,
   mayGrantGroupAdmin,
@@ -107,33 +108,49 @@ test('a super admin administers every group, with no membership at all', () => {
 // Where an invited account lands
 // ---------------------------------------------------------------------------
 
-test('a group admin inviting without naming a group lands in their own', () => {
-  // Not the deployment default, which is what an ordinary account with no group
-  // falls back to: a group admin only ever invites into their own group.
-  const target = resolveInviteGroup(admin, [member(A, true), member(B)], null);
-  assert.deepEqual(target, { groupId: A });
+test('creating an administrator without a group is refused', () => {
+  // There is no default group to fall back on any more, so an administrator
+  // created in no group would reach the panel and be able to do nothing in it.
+  // The refusal is the whole feature: a silent lockout is worse than a form
+  // error, and this is the one place no caller can skip.
+  for (const caller of [superAdmin, admin]) {
+    const target = resolveInviteGroup(caller, [member(A, true)], null, TIERS.ADMIN);
+    assert.equal(target.status, 400);
+    assert.match(target.error, /Choose the group they will belong to/);
+  }
 });
 
 test('a group admin naming a group they do not administer is refused', () => {
   // Being an ordinary member of B is not enough, which is the point.
-  const target = resolveInviteGroup(admin, [member(A, true), member(B)], B);
+  const target = resolveInviteGroup(admin, [member(A, true), member(B)], B, TIERS.ADMIN);
   assert.equal(target.status, 403);
   assert.match(target.error, /only invite people into a group you administer/);
 });
 
 test('a group admin naming a group they administer is obeyed', () => {
   const membership = [member(A, true), member(B, true)];
-  assert.deepEqual(resolveInviteGroup(admin, membership, B), { groupId: B });
+  assert.deepEqual(resolveInviteGroup(admin, membership, B, TIERS.ADMIN), { groupId: B });
 });
 
 test('somebody who administers nothing cannot invite anybody anywhere', () => {
-  const target = resolveInviteGroup(admin, [member(A)], A);
+  const target = resolveInviteGroup(admin, [member(A)], A, TIERS.ADMIN);
   assert.equal(target.status, 403);
 });
 
-test('a super admin may name any group, or none at all', () => {
-  assert.deepEqual(resolveInviteGroup(superAdmin, [], 'any-group'), { groupId: 'any-group' });
-  assert.deepEqual(resolveInviteGroup(superAdmin, [], null), { groupId: null });
+test('a super admin may name any group for a plain administrator', () => {
+  assert.deepEqual(resolveInviteGroup(superAdmin, [], 'any-group', TIERS.ADMIN), {
+    groupId: 'any-group',
+  });
+});
+
+test('creating a super administrator takes no group, and refuses one offered', () => {
+  // They bypass groups, so a membership would grant them nothing and only
+  // suggest their access came from it. Refused rather than obeyed and undone.
+  assert.deepEqual(resolveInviteGroup(superAdmin, [], null, TIERS.SUPER), { groupId: null });
+
+  const target = resolveInviteGroup(superAdmin, [], A, TIERS.SUPER);
+  assert.equal(target.status, 400);
+  assert.equal(target.error, SUPER_ADMIN_NEEDS_NO_GROUP);
 });
 
 // ---------------------------------------------------------------------------
@@ -220,6 +237,39 @@ function sourceFiles(dir) {
   });
 }
 
+test('nothing resolves against a default group any more', () => {
+  // The fallback is gone, and with it the column. A query still naming
+  // is_default would fail at runtime, and any decision still reaching for the
+  // default group would be quietly handing out access nobody granted.
+  const offenders = [];
+
+  for (const file of sourceFiles(apiRoot)) {
+    const source = readFileSync(file, 'utf8');
+    if (/\bis_default\b|\bmembershipWithFallback\b/.test(source)) offenders.push(file);
+  }
+
+  assert.deepEqual(offenders, []);
+});
+
+test('nothing reads the survey columns the audience moved off', () => {
+  // group_id, require_guild, gate_role_ids and gate_channel_ids are all gone
+  // from surveys. Every one of them still exists on groups, so the check is for
+  // the qualified survey forms rather than for the bare names.
+  const offenders = [];
+
+  for (const file of sourceFiles(apiRoot)) {
+    const source = readFileSync(file, 'utf8');
+    if (/\bs\.(?:group_id|require_guild|gate_role_ids|gate_channel_ids)\b/.test(source)) {
+      offenders.push(file);
+    }
+    if (/\bsurveys\.(?:group_id|require_guild|gate_role_ids|gate_channel_ids)\b/.test(source)) {
+      offenders.push(file);
+    }
+  }
+
+  assert.deepEqual(offenders, []);
+});
+
 test('nothing reads a per-user permission list any more', () => {
   // Migration 014 drops users.permissions. A query still naming it would fail
   // at runtime, and any authorisation decision still consulting one would be
@@ -235,6 +285,78 @@ test('nothing reads a per-user permission list any more', () => {
   }
 
   assert.deepEqual(offenders, []);
+});
+
+test('a super administrator can be put in no group, by either route', () => {
+  // Both membership routes settle it through loadMemberTarget, so there is one
+  // decision and one wording rather than a check bolted onto each.
+  const source = readFileSync(join(apiRoot, 'routes', 'groups.js'), 'utf8');
+
+  assert.match(source, /if \(rows\[0\]\.tier === TIERS\.SUPER\) \{[\s\S]*SUPER_ADMIN_NEEDS_NO_GROUP/);
+  for (const route of [
+    "groupsRouter.post('/:id/members'",
+    "groupsRouter.patch('/:id/members/:userId'",
+  ]) {
+    const from = source.indexOf(route);
+    assert.ok(from > 0, `${route} is gone`);
+
+    // Up to whichever route is declared next, so the check reads that route's
+    // own body rather than the first closing brace inside it.
+    const next = source.indexOf('groupsRouter.', from + route.length);
+    const body = source.slice(from, next === -1 ? undefined : next);
+    assert.ok(
+      body.includes('loadMemberTarget'),
+      `${route} no longer refuses a super administrator`,
+    );
+  }
+});
+
+test('the assignable list never offers a super administrator', () => {
+  // Filtered out at the source rather than left to be picked and then refused.
+  const source = readFileSync(join(apiRoot, 'routes', 'groups.js'), 'utf8');
+  assert.match(source, /tier <> 'none' AND tier <> 'super_admin'/);
+});
+
+test('promoting somebody to super administrator clears their memberships', () => {
+  // The two states can never coexist, so the clearing shares the transaction
+  // with the tier change rather than following it and hoping.
+  const source = readFileSync(join(apiRoot, 'routes', 'admin.js'), 'utf8');
+  const promotion = source.slice(source.indexOf('if (tier === TIERS.SUPER) {'));
+
+  assert.match(
+    promotion.slice(0, 400),
+    /DELETE FROM group_members WHERE user_id = \$1/,
+  );
+  assert.ok(
+    source.indexOf('const rowCount = await transaction') < source.indexOf('if (tier === TIERS.SUPER) {'),
+    'the membership clear no longer shares the tier change transaction',
+  );
+});
+
+test('demoting a super administrator requires somewhere to land', () => {
+  // They hold no memberships by construction, so a demotion without a group is
+  // the same silent lockout as creating an admin without one.
+  const source = readFileSync(join(apiRoot, 'routes', 'admin.js'), 'utf8');
+  assert.match(source, /const demoting = target\[0\]\.tier === TIERS\.SUPER && tier !== TIERS\.SUPER/);
+  assert.match(source, /requiresGroup: true/);
+});
+
+test('removing somebody from their only group is refused', () => {
+  // Membership is the whole of a plain administrator's access now, so this
+  // would leave an account that reaches the panel and can do nothing in it.
+  const source = readFileSync(join(apiRoot, 'routes', 'groups.js'), 'utf8');
+  assert.match(source, /held\.length === 1 && held\[0\]\.group_id === req\.params\.id/);
+  assert.match(source, /lastGroup: true/);
+});
+
+test('deleting a group that would strand a survey is refused', () => {
+  // There is no default group to hand its surveys to any more, and a survey
+  // must always have one. The count is of surveys in this group and no other.
+  const source = readFileSync(join(apiRoot, 'routes', 'groups.js'), 'utf8');
+  assert.match(source, /surveysAffected: stranded\[0\]\.n/);
+  assert.match(source, /other\.survey_id = sg\.survey_id AND other\.group_id <> \$1/);
+  // And never by quietly moving them somewhere.
+  assert.doesNotMatch(source, /UPDATE surveys SET group/);
 });
 
 test('shaping groups stays super-admin only, and membership does not', () => {

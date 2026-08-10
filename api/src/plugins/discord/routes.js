@@ -544,6 +544,11 @@ discordAdminRouter.get('/settings', requireAdmin, async (_req, res, next) => {
       }
     }
 
+    // Which group a role- or channel-derived admin lands in is chosen from the
+    // deployment's own groups, so they are listed alongside the roles and
+    // channels the choice belongs with.
+    const { rows: groups } = await query('SELECT id, name FROM groups ORDER BY name');
+
     return res.json({
       enabled: isPluginEnabled(current().plugins, PLUGINS.DISCORD),
       configured: settings.configured,
@@ -553,6 +558,11 @@ discordAdminRouter.get('/settings', requireAdmin, async (_req, res, next) => {
       guild: settings.configured ? { name: settings.guildName } : null,
       roles,
       channels,
+      groups: groups.map((row) => ({ id: row.id, name: row.name })),
+      // Kept out of `values`, which is the credential set and stays null until
+      // a server is connected: the landing group is a choice about this
+      // deployment's groups and is answered either way.
+      adminGroupId: settings.adminGroupId,
       values: settings.configured
         ? {
             clientId: settings.clientId,
@@ -632,8 +642,23 @@ discordAdminRouter.post('/settings', requireAdmin, async (req, res, next) => {
       ? req.body.adminChannelIds.map(String)
       : [];
 
+    // The group role- and channel-derived admins land in. Checked against the
+    // groups table rather than stored on trust, since a stale id would leave
+    // every such account with no access and nothing to explain why.
+    const adminGroupId = req.body?.adminGroupId ? String(req.body.adminGroupId) : null;
+    if (adminGroupId) {
+      const { rows: group } = await query('SELECT id FROM groups WHERE id = $1', [adminGroupId]);
+      if (group.length === 0) return res.status(404).json({ error: 'That group does not exist.' });
+    }
+
     await saveDiscordSettings(
-      { ...values, guildName: verified.guild.name, adminRoleIds, adminChannelIds },
+      {
+        ...values,
+        guildName: verified.guild.name,
+        adminRoleIds,
+        adminChannelIds,
+        adminGroupId,
+      },
       req.user.id,
     );
     invalidateGuildCache();
@@ -749,12 +774,13 @@ discordAdminRouter.post('/admins', requireGroupAdmin, async (req, res, next) => 
     const membership = req.user.isSuperAdmin
       ? []
       : (await loadGroupContext(req.user.id)).membership;
-    const target = resolveInviteGroup(req.user, membership, requestedGroupId(req.body));
+    const target = resolveInviteGroup(
+      req.user,
+      membership,
+      requestedGroupId(req.body),
+      standing.tier,
+    );
     if (target.error) return res.status(target.status).json({ error: target.error });
-
-    if (standing.groupAdmin && !target.groupId) {
-      return res.status(400).json({ error: 'Choose the group they will administer.' });
-    }
 
     if (target.groupId) {
       const { rows: group } = await query('SELECT id FROM groups WHERE id = $1', [target.groupId]);
@@ -797,6 +823,11 @@ discordAdminRouter.post('/admins', requireGroupAdmin, async (req, res, next) => 
            ON CONFLICT (group_id, user_id) DO UPDATE SET is_admin = EXCLUDED.is_admin`,
           [target.groupId, rows[0].id, standing.groupAdmin],
         );
+      } else if (standing.tier === TIERS.SUPER) {
+        // Granting super admin to an id that already had an account promotes
+        // it, and a super administrator holds no group memberships: clearing
+        // them here is the same rule the Users page applies on promotion.
+        await client.query('DELETE FROM group_members WHERE user_id = $1', [rows[0].id]);
       }
       return rows[0];
     });

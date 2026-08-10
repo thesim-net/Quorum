@@ -164,6 +164,15 @@ export function loadSession() {
 
       const tier = resolveTier(session.tier, pluginTier);
 
+      // An account whose admin tier came from a Discord role or channel is the
+      // one kind nobody ever chose a group for: it is never created, it is
+      // resolved per request. The plugin names the group those accounts resolve
+      // against, and it is carried here so the group layer can apply it without
+      // asking how anybody became an admin. Unset means no access at all,
+      // deliberately: no group has been chosen, so none is guessed.
+      const discordAdminGroupId =
+        pluginTier === TIERS.ADMIN ? settings.discord.adminGroupId ?? null : null;
+
       req.user = {
         id: session.user_id,
         discordId: session.discord_id,
@@ -179,6 +188,9 @@ export function loadSession() {
         // True when at least one of their memberships administers its group.
         // Never a licence over a particular group - see requireGroupControl.
         administersAGroup: Boolean(session.administers_a_group),
+        // Set only for Discord role- and channel-derived admins; null for
+        // everybody else, including anyone whose tier is stored on the account.
+        discordAdminGroupId,
         // No permission list here on purpose. What a plain admin may do depends
         // on which group owns the thing they are touching, so it is resolved
         // per request in lib/groups.js rather than carried on the session.

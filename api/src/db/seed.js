@@ -177,6 +177,15 @@ export async function seed(respondents = 60) {
     );
     const survey = surveyRows[0];
 
+    // A survey must belong to a group, or nobody can take it and no admin can
+    // reach it. The demo joins whichever group the deployment already has,
+    // taking the first by name so a re-seed lands in the same place.
+    await client.query(
+      `INSERT INTO survey_groups (survey_id, group_id)
+       SELECT $1, id FROM groups ORDER BY name LIMIT 1`,
+      [survey.id],
+    );
+
     const persisted = [];
     for (const [index, question] of QUESTIONS.entries()) {
       const { rows } = await client.query(

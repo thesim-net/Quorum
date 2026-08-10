@@ -25,7 +25,12 @@ import {
 } from '../lib/uploads.js';
 import { ensureRespondent } from '../middleware/respondent.js';
 import { cachedGuildName, channelVisibleTo, guildMembership } from '../plugins/discord/gate.js';
-import { ACCESS, refusal, resolveAccess } from '../plugins/discord/guildGate.js';
+import {
+  ACCESS,
+  everyGroupRequiresGuild,
+  refusal,
+  resolveGroupAccess,
+} from '../plugins/discord/guildGate.js';
 
 export const surveyRouter = Router();
 
@@ -87,24 +92,41 @@ const discordIdOf = (req) => req.user?.discordId ?? req.respondentDiscordId ?? n
 const guildName = () => current().discord.guildName ?? cachedGuildName();
 
 /**
+ * The audience rules of every group a survey belongs to.
+ *
+ * @param {string} surveyId
+ * @returns {Promise<Array<{require_guild: boolean, gate_role_ids: string[],
+ *   gate_channel_ids: string[]}>>} One entry per group.
+ */
+async function audiencesFor(surveyId) {
+  const { rows } = await query(
+    `SELECT g.require_guild, g.gate_role_ids, g.gate_channel_ids
+       FROM survey_groups sg JOIN groups g ON g.id = sg.group_id
+      WHERE sg.survey_id = $1`,
+    [surveyId],
+  );
+  return rows;
+}
+
+/**
  * Decides whether the caller may open a survey.
  *
  * The policy itself is in `guildGate.js`; this supplies the Discord lookups it
- * runs on. An anonymous survey never reaches them - that is what "truly
+ * runs on. A survey with an open group never reaches them - that is what "truly
  * anonymous" means here, and it is why a Discord outage cannot touch one.
  *
- * @param {object} survey Survey row.
+ * @param {Array<object>} audiences The survey's groups' audience rules.
  * @param {import('express').Request} req The request, for its identities.
  * @returns {Promise<{allowed: boolean, status?: number, code?: string,
  *   reason?: string, guild?: string|null}>} Verdict, with a participant-safe
  *   reason when refused.
  */
-async function surveyAccess(survey, req) {
+async function surveyAccess(audiences, req) {
   const settings = current();
 
-  const outcome = await resolveAccess(
+  const outcome = await resolveGroupAccess(
     {
-      survey,
+      audiences,
       pluginReady:
         isPluginEnabled(settings.plugins, PLUGINS.DISCORD) && settings.discord.configured,
       discordId: discordIdOf(req),
@@ -115,6 +137,23 @@ async function surveyAccess(survey, req) {
   if (outcome === ACCESS.OPEN) return { allowed: true };
   return { allowed: false, ...refusal(outcome, guildName()) };
 }
+
+/**
+ * Attaches a survey's effective gating to the row.
+ *
+ * `require_guild` is no longer a column: it is true only when every group the
+ * survey belongs to requires the guild, because a single open group leaves an
+ * anonymous way in. Everything downstream that asks "does this survey know who
+ * is answering" - the respondent key above all - reads it from here.
+ *
+ * @param {object} survey Survey row.
+ * @param {Array<object>} audiences The survey's groups' audience rules.
+ * @returns {object} The row, with `require_guild` derived from its groups.
+ */
+const withGating = (survey, audiences) => ({
+  ...survey,
+  require_guild: everyGroupRequiresGuild(audiences),
+});
 
 /**
  * Loads a survey by slug and confirms the caller may see it.
@@ -128,15 +167,15 @@ async function loadAccessibleSurvey(slug, req) {
   const { rows } = await query('SELECT * FROM surveys WHERE slug = $1', [slug]);
   if (rows.length === 0) return { error: 'Survey not found.', status: 404 };
 
-  const survey = rows[0];
-  if (survey.status === 'draft') return { error: 'Survey not found.', status: 404 };
+  if (rows[0].status === 'draft') return { error: 'Survey not found.', status: 404 };
 
-  const access = await surveyAccess(survey, req);
+  const audiences = await audiencesFor(rows[0].id);
+  const access = await surveyAccess(audiences, req);
   if (!access.allowed) {
     return { error: access.reason, status: access.status, code: access.code, guild: access.guild };
   }
 
-  return { survey };
+  return { survey: withGating(rows[0], audiences) };
 }
 
 /**
@@ -180,16 +219,33 @@ async function findOwnResponse(survey, respondentId) {
 surveyRouter.get('/', async (req, res, next) => {
   try {
     const { rows } = await query(
-      `SELECT * FROM surveys
-        WHERE status = 'open'
-          AND (opens_at IS NULL OR opens_at <= now())
-          AND (closes_at IS NULL OR closes_at > now())
-        ORDER BY created_at DESC`,
+      // Each survey carries its groups' audience rules with it: the gate is
+      // evaluated per survey, and one query beats one per row.
+      `SELECT s.*,
+              COALESCE(
+                jsonb_agg(
+                  jsonb_build_object(
+                    'require_guild', g.require_guild,
+                    'gate_role_ids', g.gate_role_ids,
+                    'gate_channel_ids', g.gate_channel_ids
+                  )
+                ) FILTER (WHERE g.id IS NOT NULL),
+                '[]'::jsonb
+              ) AS audiences
+         FROM surveys s
+         LEFT JOIN survey_groups sg ON sg.survey_id = s.id
+         LEFT JOIN groups g ON g.id = sg.group_id
+        WHERE s.status = 'open'
+          AND (s.opens_at IS NULL OR s.opens_at <= now())
+          AND (s.closes_at IS NULL OR s.closes_at > now())
+        GROUP BY s.id
+        ORDER BY s.created_at DESC`,
     );
 
     const visible = [];
-    for (const survey of rows) {
-      const access = await surveyAccess(survey, req);
+    for (const row of rows) {
+      const survey = withGating(row, row.audiences);
+      const access = await surveyAccess(row.audiences, req);
 
       // A gated survey is still listed for someone who has not signed in with
       // Discord yet, flagged so the client can say what it needs. Everything
@@ -410,9 +466,18 @@ async function loadOwnWritableResponse(responseId, req) {
     `SELECT r.id, r.survey_id, r.respondent_hash, r.status, r.started_at, r.completed_at,
             s.id AS s_id, s.slug, s.status AS s_status, s.opens_at, s.closes_at,
             s.allow_response_edits, s.collect_timing, s.collect_location, s.collect_identity,
-            s.require_guild, s.one_response_per_person, s.respondent_key
-       FROM responses r JOIN surveys s ON s.id = r.survey_id
-      WHERE r.id = $1`,
+            s.one_response_per_person, s.respondent_key,
+            -- Gating is a property of the survey's groups now, so the respondent
+            -- key this response is matched by has to be derived the same way it
+            -- was when the response was started.
+            bool_and(g.require_guild) FILTER (WHERE g.id IS NOT NULL) AS all_gated,
+            count(g.id) AS group_count
+       FROM responses r
+       JOIN surveys s ON s.id = r.survey_id
+       LEFT JOIN survey_groups sg ON sg.survey_id = s.id
+       LEFT JOIN groups g ON g.id = sg.group_id
+      WHERE r.id = $1
+      GROUP BY r.id, s.id`,
     [responseId],
   );
   if (rows.length === 0) return { error: 'Response not found.', status: 404 };
@@ -426,7 +491,7 @@ async function loadOwnWritableResponse(responseId, req) {
     closes_at: row.closes_at,
     allow_response_edits: row.allow_response_edits,
     one_response_per_person: row.one_response_per_person,
-    require_guild: row.require_guild,
+    require_guild: Number(row.group_count) > 0 && row.all_gated === true,
     collect_timing: row.collect_timing,
     collect_location: row.collect_location,
     collect_identity: row.collect_identity,

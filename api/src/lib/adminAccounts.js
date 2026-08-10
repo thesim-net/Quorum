@@ -42,10 +42,21 @@ export function requestedStanding(body) {
 }
 
 /**
+ * What a super administrator is told when somebody tries to put them in a group.
+ *
+ * One fact, one wording, wherever it is refused: adding them as a member,
+ * making them an administrator of a group, and naming a group while creating
+ * them all say the same thing, because they are all the same mistake.
+ */
+export const SUPER_ADMIN_NEEDS_NO_GROUP =
+  'A super administrator already has access to every group.';
+
+/**
  * The group a create request names, if it names one.
  *
- * Null means none was named, which for a super admin means "leave membership
- * alone" - an account in no group resolves against the default group.
+ * Null means none was named. There is no longer anything for that to fall back
+ * on - an account in no group has no access - so it is only valid for a super
+ * administrator, who bypasses groups entirely.
  *
  * @param {object|undefined} body The request body.
  * @returns {string|null} A group id, or null.
@@ -86,25 +97,42 @@ export function administersGroup(user, membership, groupId) {
 /**
  * The group a newly invited account is placed into.
  *
- * A super admin may name any group, or none at all. A group administrator
- * invites into a group they administer: naming another is refused, and naming
- * none lands the invitee in the group they administer rather than the
- * deployment default, because they are never inviting into somebody else's
- * group. An administrator of several must say which.
+ * A group is mandatory, and nothing supplies one on the invitee's behalf. There
+ * used to be a default group for an account created without one to resolve
+ * against; with that gone, an administrator in no group can do nothing at all,
+ * so creating one is a silent lockout rather than a shortcut. Naming a group is
+ * therefore part of creating an administrator, refused here so that no form,
+ * script or plugin route can skip it.
+ *
+ * A super administrator is the exception in the other direction: they bypass
+ * groups, so a group is not merely unnecessary for them but wrong, and naming
+ * one is refused rather than obeyed and then cleaned up.
+ *
+ * A group administrator invites into a group they administer, and naming
+ * another is refused: they are never inviting into somebody else's group.
  *
  * @param {{tier?: string}} user The caller.
  * @param {Array<{groupId: string, isAdmin?: boolean}>} membership Their memberships.
  * @param {string|null} requested The group id from the request, if any.
+ * @param {string} tier The tier being granted, from `requestedStanding`.
  * @returns {{groupId: string|null}|{error: string, status: number}}
  */
-export function resolveInviteGroup(user, membership, requested) {
-  if (isSuper(user)) return { groupId: requested ?? null };
+export function resolveInviteGroup(user, membership, requested, tier = TIERS.ADMIN) {
+  if (tier === TIERS.SUPER) {
+    if (requested) return { error: SUPER_ADMIN_NEEDS_NO_GROUP, status: 400 };
+    return { groupId: null };
+  }
+
+  if (isSuper(user)) {
+    if (!requested) return { error: 'Choose the group they will belong to.', status: 400 };
+    return { groupId: requested };
+  }
 
   const administered = administeredGroupIds(membership);
   if (administered.size === 0) {
     return { error: 'You do not administer a group to invite anybody into.', status: 403 };
   }
-  if (!requested) return { groupId: [...administered][0] };
+  if (!requested) return { error: 'Choose the group they will belong to.', status: 400 };
   if (!administered.has(requested)) {
     return { error: 'You can only invite people into a group you administer.', status: 403 };
   }

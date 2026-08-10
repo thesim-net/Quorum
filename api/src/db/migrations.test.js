@@ -22,6 +22,7 @@ function migration(name) {
 const GUILD_GATE = migration('013_guild_gate.sql');
 const DROP_USER_PERMISSIONS = migration('014_drop_user_permissions.sql');
 const GROUP_ADMINS = migration('015_group_admins.sql');
+const SURVEY_GROUPS = migration('016_survey_groups.sql');
 
 test('013 adds the guild gate switched off, so nothing becomes gated by surprise', () => {
   assert.match(
@@ -103,4 +104,86 @@ test('015 leaves the tier enum alone, so tier ordering is untouched', () => {
   // learn about it; keeping it off the enum is what makes that a non-question.
   assert.doesNotMatch(GROUP_ADMINS, /ALTER TYPE/);
   assert.doesNotMatch(GROUP_ADMINS, /admin_tier/);
+});
+
+test('016 moves every survey into the join table before dropping the column', () => {
+  // The order is the whole of it: reading surveys.group_id after dropping it
+  // would fail, and dropping it first would lose every survey's ownership.
+  const copied = SURVEY_GROUPS.indexOf(
+    'INSERT INTO survey_groups (survey_id, group_id) SELECT id, group_id FROM surveys',
+  );
+  const dropped = SURVEY_GROUPS.indexOf('ALTER TABLE surveys DROP COLUMN group_id');
+
+  assert.ok(copied > 0, 'existing surveys are no longer copied into survey_groups');
+  assert.ok(dropped > copied, 'surveys.group_id is dropped before it has been read');
+});
+
+test('016 keeps every gated survey gated, by gating its groups', () => {
+  // Losing this makes every restricted survey public on the next deploy, which
+  // is the one mistake this migration must never make.
+  assert.match(
+    SURVEY_GROUPS,
+    /UPDATE groups g SET require_guild = true WHERE EXISTS \( SELECT 1 FROM survey_groups sg JOIN surveys s ON s\.id = sg\.survey_id WHERE sg\.group_id = g\.id AND s\.require_guild \)/,
+  );
+});
+
+test('016 unions the narrowing lists into the group, from gated surveys only', () => {
+  // An ungated survey's leftover lists were never evaluated, so carrying them
+  // across would invent a restriction rather than preserve one.
+  for (const column of ['gate_role_ids', 'gate_channel_ids']) {
+    const single = column === 'gate_role_ids' ? 'role_id' : 'channel_id';
+    assert.match(
+      SURVEY_GROUPS,
+      new RegExp(
+        `UPDATE groups g SET ${column} = u\\.\\w+ FROM \\( SELECT sg\\.group_id, ` +
+          `array_agg\\(DISTINCT ${single}\\) AS \\w+ FROM survey_groups sg JOIN surveys s ` +
+          `ON s\\.id = sg\\.survey_id CROSS JOIN LATERAL unnest\\(s\\.${column}\\) AS ${single} ` +
+          'WHERE s\\.require_guild GROUP BY sg\\.group_id \\) u WHERE u\\.group_id = g\\.id',
+      ),
+    );
+  }
+});
+
+test('016 gives the groups their audience before taking the surveys\' away', () => {
+  const backfilled = SURVEY_GROUPS.lastIndexOf('WHERE u.group_id = g.id');
+  for (const column of ['require_guild', 'gate_role_ids', 'gate_channel_ids']) {
+    const dropped = SURVEY_GROUPS.indexOf(`ALTER TABLE surveys DROP COLUMN ${column}`);
+    assert.ok(dropped > backfilled, `surveys.${column} is dropped before it has been read`);
+  }
+});
+
+test('016 drops the default flag and nothing else about the group that held it', () => {
+  // The CONCEPT goes; the group survives as an ordinary one. On this deployment
+  // that group is "Public", which is in daily use - deleting the row rather
+  // than the column would take a real group's surveys with it.
+  assert.match(SURVEY_GROUPS, /ALTER TABLE groups DROP COLUMN is_default/);
+  assert.doesNotMatch(SURVEY_GROUPS, /DELETE FROM groups/);
+  assert.doesNotMatch(SURVEY_GROUPS, /DROP TABLE groups/);
+});
+
+test('016 clears the group memberships super administrators hold', () => {
+  // They reach every group already, so a membership grants them nothing and
+  // only implies their access comes from that group - which stops being an
+  // idle inaccuracy the moment the default fallback is gone.
+  assert.match(
+    SURVEY_GROUPS,
+    /DELETE FROM group_members m USING users u WHERE u\.id = m\.user_id AND u\.tier = 'super_admin'/,
+  );
+});
+
+test('016 adds somewhere for Discord-derived admins to land, defaulting to nowhere', () => {
+  // Nullable and unset: with no group chosen those accounts get no access,
+  // rather than a guessed one. A DEFAULT here would be exactly that guess.
+  assert.match(
+    SURVEY_GROUPS,
+    /ALTER TABLE app_settings ADD COLUMN discord_admin_group_id uuid REFERENCES groups\(id\) ON DELETE SET NULL/,
+  );
+  assert.doesNotMatch(SURVEY_GROUPS, /discord_admin_group_id uuid[^;]*DEFAULT/);
+});
+
+test('016 leaves responses and answers untouched', () => {
+  // Who a survey is for changed; what people answered did not. A survey moving
+  // between groups must never disturb a response already given.
+  assert.doesNotMatch(SURVEY_GROUPS, /\bresponses\b/);
+  assert.doesNotMatch(SURVEY_GROUPS, /\banswers\b/);
 });
