@@ -1,4 +1,4 @@
-Quorum is licensed under the PolyForm Perimeter License 1.0.0.
+Quorum is licensed under the PolyForm Perimeter License 1.0.1.
 
 You may use, modify, and self-host Quorum for any purpose, including running
 your own business on it, free of charge. You may not provide to others any
@@ -10,9 +10,9 @@ Required Notice: Copyright 2026 Thomas Loupe (https://thomasloupe.com)
 
 ---
 
-# PolyForm Perimeter License 1.0.0
+# PolyForm Perimeter License 1.0.1
 
-<https://polyformproject.org/licenses/perimeter/1.0.0>
+<https://polyformproject.org/licenses/perimeter/1.0.1>
 
 ## Acceptance
 

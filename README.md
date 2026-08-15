@@ -130,4 +130,4 @@ Discord has no "who is in a channel" endpoint. The channel gate resolves a membe
 
 ## License
 
-Source-available under the [PolyForm Perimeter License 1.0.0](LICENSE.md). Use, modify, and self-host Quorum for any purpose, including running a business on it, free of charge. You may not resell, repackage, or offer it as a product or hosted service that competes with Quorum.
+Source-available under the [PolyForm Perimeter License 1.0.1](LICENSE.md). Use, modify, and self-host Quorum for any purpose, including running a business on it, free of charge. You may not resell, repackage, or offer it as a product or hosted service that competes with Quorum.
