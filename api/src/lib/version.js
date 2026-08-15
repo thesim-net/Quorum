@@ -25,4 +25,4 @@ export const BUILD_TIME = process.env.QUORUM_BUILD_TIME || 'unknown';
  * The source repository the footer links its commit to. Reuses the update
  * check's repo so the two never point at different places.
  */
-export const REPO = process.env.UPDATE_CHECK_REPO || 'thomasloupe/Quorum';
+export const REPO = process.env.UPDATE_CHECK_REPO || 'TheSim-net/Quorum';

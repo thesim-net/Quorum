@@ -34,7 +34,7 @@ const owner = () => (REPO.split('/')[0] || 'thomasloupe').toLowerCase();
 /**
  * Resolves the digest a GHCR tag currently points at.
  *
- * @param {string} repo e.g. "thomasloupe/quorum-api".
+ * @param {string} repo e.g. "thesim-net/quorum-api".
  * @param {string} ref A tag or digest.
  * @returns {Promise<string|null>} The `sha256:...` digest, or null on failure.
  */

@@ -20,7 +20,7 @@ let cache = null;
 const checkEnabled = () => process.env.UPDATE_CHECK !== 'off';
 
 /** The repo whose latest release is polled. */
-const checkRepo = () => process.env.UPDATE_CHECK_REPO ?? 'thomasloupe/Quorum';
+const checkRepo = () => process.env.UPDATE_CHECK_REPO ?? 'TheSim-net/Quorum';
 
 /**
  * Parses a semantic version, tolerating a leading "v".

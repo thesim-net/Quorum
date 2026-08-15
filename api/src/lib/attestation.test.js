@@ -7,11 +7,11 @@ test('formatStatus builds the ghcr image and verify commands from the repo', () 
   const s = formatStatus('verified', 'sha256:abc');
   assert.equal(s.state, 'verified');
   assert.equal(s.digest, 'sha256:abc');
-  assert.equal(s.image, 'ghcr.io/thomasloupe/quorum-api');
-  assert.match(s.verify.api, /oci:\/\/ghcr\.io\/thomasloupe\/quorum-api:/);
-  assert.match(s.verify.web, /oci:\/\/ghcr\.io\/thomasloupe\/quorum-web:/);
-  assert.match(s.verify.api, /--repo thomasloupe\/Quorum$/);
-  assert.equal(s.attestationUrl, 'https://github.com/thomasloupe/Quorum/attestations');
+  assert.equal(s.image, 'ghcr.io/thesim-net/quorum-api');
+  assert.match(s.verify.api, /oci:\/\/ghcr\.io\/thesim-net\/quorum-api:/);
+  assert.match(s.verify.web, /oci:\/\/ghcr\.io\/thesim-net\/quorum-web:/);
+  assert.match(s.verify.api, /--repo TheSim-net\/Quorum$/);
+  assert.equal(s.attestationUrl, 'https://github.com/TheSim-net/Quorum/attestations');
 });
 
 test('formatStatus carries a null digest through for unverifiable states', () => {

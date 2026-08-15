@@ -29,6 +29,9 @@ jobs:
         run: |
           echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          # GHCR rejects uppercase image paths and the org is "TheSim-net",
+          # so the owner has to be lowercased before it goes in a tag.
+          echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v4
 
@@ -50,8 +53,8 @@ jobs:
             VERSION=${{ steps.meta.outputs.version }}
             BUILD_TIME=${{ steps.meta.outputs.build_time }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/quorum-api:${{ steps.meta.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/quorum-api:latest
+            ghcr.io/${{ steps.meta.outputs.owner }}/quorum-api:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ steps.meta.outputs.owner }}/quorum-api:latest
 
       - name: Build and push the web image
         id: build_web
@@ -63,20 +66,20 @@ jobs:
             GIT_SHA=${{ github.sha }}
             VERSION=${{ steps.meta.outputs.version }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/quorum-web:${{ steps.meta.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/quorum-web:latest
+            ghcr.io/${{ steps.meta.outputs.owner }}/quorum-web:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ steps.meta.outputs.owner }}/quorum-web:latest
 
       - name: Attest API image provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-name: ghcr.io/${{ github.repository_owner }}/quorum-api
+          subject-name: ghcr.io/${{ steps.meta.outputs.owner }}/quorum-api
           subject-digest: ${{ steps.build_api.outputs.digest }}
           push-to-registry: true
 
       - name: Attest web image provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-name: ghcr.io/${{ github.repository_owner }}/quorum-web
+          subject-name: ghcr.io/${{ steps.meta.outputs.owner }}/quorum-web
           subject-digest: ${{ steps.build_web.outputs.digest }}
           push-to-registry: true
 
