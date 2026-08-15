@@ -457,9 +457,13 @@ export function TakeSurvey() {
       </div>
 
       <div className="card">
+        {/* Label it either way. Marking only the optional ones meant a survey
+            where everything is required carried no marking at all, so people
+            met the requirement as a submission error rather than knowing up
+            front. Reported by a respondent on the first live survey. */}
         <p className="muted">
           Question {safeIndex + 1} of {visible.length}
-          {question.required ? '' : ' · optional'}
+          {question.required ? ' · required' : ' · optional'}
         </p>
         <h2>{question.prompt}</h2>
         {question.helpText ? <p className="muted">{question.helpText}</p> : null}
