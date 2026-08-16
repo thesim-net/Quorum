@@ -1,4 +1,5 @@
 import { mkdir, readFile, writeFile, stat, rename } from 'node:fs/promises';
+import net from 'node:net';
 import { dirname, join } from 'node:path';
 
 /**
@@ -29,6 +30,32 @@ const SOURCES = [
 
 /** Cache format version. Bumping it invalidates every existing cache file. */
 const CACHE_VERSION = 1;
+
+/** Per-request ceiling. RIPE's file is the largest, at around 18 MB. */
+const REQUEST_TIMEOUT_MS = 60_000;
+
+/** Attempts per registry before giving up on it for this build. */
+const FETCH_ATTEMPTS = 3;
+
+/**
+ * How long to wait for one address family before trying the next.
+ *
+ * Node tries IPv6 and IPv4 in parallel and abandons an attempt after 250 ms by
+ * default. A container without an IPv6 route - which is the default for Docker -
+ * fails IPv6 instantly, so the IPv4 attempt is the only one that can succeed;
+ * if the registry is further away than that window, every attempt is abandoned
+ * just before it completes and the whole fetch reports ETIMEDOUT in under a
+ * third of a second. AFRINIC is roughly 260 ms from Europe, which is exactly
+ * far enough to lose a continent's worth of allocations to a default.
+ */
+const FAMILY_ATTEMPT_TIMEOUT_MS = 3_000;
+
+/**
+ * A table built while a registry was unreachable is missing that registry's
+ * continent. Rather than serve that gap for a full refresh period, a partial
+ * cache is treated as stale after a day so the next start tries again.
+ */
+const PARTIAL_REFRESH_DAYS = 1;
 
 /** Returned by {@link lookup} when no allocation covers the value. */
 const NO_MATCH = -1;
@@ -193,6 +220,35 @@ export function pack(parsed) {
 }
 
 /**
+ * Fetches one registry's file, retrying a couple of times before giving up.
+ *
+ * A blip while fetching is otherwise expensive out of proportion to its cause:
+ * the resulting table is missing a continent, and it gets cached.
+ *
+ * @param {string} url
+ * @param {Function} fetchImpl
+ * @returns {Promise<string>}
+ */
+async function fetchSource(url, fetchImpl) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt += 1) {
+    try {
+      const res = await fetchImpl(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+      if (!res.ok) throw new Error(`responded ${res.status}`);
+      return await res.text();
+    } catch (error) {
+      lastError = error;
+      if (attempt < FETCH_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
+      }
+    }
+  }
+
+  throw new Error(`${lastError?.cause?.code ?? lastError?.message} after ${FETCH_ATTEMPTS} tries`);
+}
+
+/**
  * Fetches every registry and compiles one table.
  *
  * A single registry being unreachable degrades coverage rather than failing the
@@ -207,12 +263,14 @@ export async function buildTable(fetchImpl = fetch) {
   const v6 = [];
   let sources = 0;
 
+  // Only ever widened, never narrowed: if the host application has already
+  // chosen a longer window, leave its choice alone.
+  if (net.getDefaultAutoSelectFamilyAttemptTimeout() < FAMILY_ATTEMPT_TIMEOUT_MS) {
+    net.setDefaultAutoSelectFamilyAttemptTimeout(FAMILY_ATTEMPT_TIMEOUT_MS);
+  }
+
   const results = await Promise.allSettled(
-    SOURCES.map(async (url) => {
-      const res = await fetchImpl(url);
-      if (!res.ok) throw new Error(`${url} responded ${res.status}`);
-      return parseDelegations(await res.text());
-    }),
+    SOURCES.map(async (url) => parseDelegations(await fetchSource(url, fetchImpl))),
   );
 
   for (const [index, result] of results.entries()) {
@@ -280,6 +338,10 @@ export function deserialise(text) {
   const header = firstBreak === -1 ? text : text.slice(0, firstBreak);
   if (!header.startsWith(`#v${CACHE_VERSION} `)) return null;
 
+  // How many registries answered when this file was written. A file built while
+  // one was down is missing that registry's allocations entirely.
+  const sources = Number(/\bsources=(\d+)/.exec(header)?.[1] ?? 0);
+
   const FAMILY_V4 = 52; // '4'
   const FAMILY_V6 = 54; // '6'
 
@@ -325,7 +387,7 @@ export function deserialise(text) {
     }
   }
 
-  return { v4, v6, countries };
+  return { v4, v6, countries, sources };
 }
 
 /**
@@ -400,7 +462,16 @@ export async function loadTable(cacheDir, maxAgeDays) {
     const ageDays = (Date.now() - info.mtimeMs) / 86_400_000;
     if (ageDays < maxAgeDays) {
       const cached = deserialise(await readFile(cachePath, 'utf8'));
-      if (cached) return cached;
+      const complete = cached && cached.sources >= SOURCES.length;
+      if (cached && (complete || ageDays < PARTIAL_REFRESH_DAYS)) {
+        if (!complete) {
+          console.warn(
+            `Country ranges were built from only ${cached.sources} of ${SOURCES.length} ` +
+              'registries; some countries will read as unknown until the next refresh.',
+          );
+        }
+        return cached;
+      }
     }
   } catch {
     // No usable cache; fall through and build one.
@@ -413,7 +484,14 @@ export async function loadTable(cacheDir, maxAgeDays) {
   }
 
   const { sources } = built;
-  const table = pack(built);
+  const table = { ...pack(built), sources };
+
+  if (sources < SOURCES.length) {
+    console.warn(
+      `Country ranges built from only ${sources} of ${SOURCES.length} registries; ` +
+        'the missing ones will read as unknown, and this will be retried tomorrow.',
+    );
+  }
 
   // The unpacked rows are an order of magnitude larger than the packed table
   // and nothing needs them again. Dropping them here keeps them from sitting on

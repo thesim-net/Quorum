@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  buildTable,
   countryOfIp,
   deserialise,
   ipv4ToInt,
@@ -11,6 +12,21 @@ import {
   parseDelegations,
   serialise,
 } from './rir.js';
+
+const ONE_ROW = 'arin|US|ipv4|8.8.8.0|256|19921201|allocated\n';
+
+/** A fetch stand-in that fails the first `failures` calls for a given URL. */
+function flakyFetch(failures, body = ONE_ROW) {
+  const attempts = new Map();
+  const stub = async (url) => {
+    const seen = (attempts.get(url) ?? 0) + 1;
+    attempts.set(url, seen);
+    if (seen <= failures) throw Object.assign(new Error('fetch failed'), { cause: { code: 'ETIMEDOUT' } });
+    return { ok: true, text: async () => body };
+  };
+  stub.attempts = attempts;
+  return stub;
+}
 
 test('parses dotted-quad IPv4', () => {
   assert.equal(ipv4ToInt('0.0.0.0'), 0);
@@ -164,6 +180,28 @@ test('private and unroutable addresses resolve to nothing', () => {
   assert.equal(countryOfIp(table, 'not-an-ip'), null);
   assert.equal(countryOfIp(table, ''), null);
   assert.equal(countryOfIp(null, '8.8.8.8'), null);
+});
+
+test('a registry that fails once is retried rather than dropped', async () => {
+  const fetchImpl = flakyFetch(1);
+  const built = await buildTable(fetchImpl);
+
+  assert.equal(built.sources, 5, 'all five registries should end up counted');
+  for (const [, count] of fetchImpl.attempts) assert.equal(count, 2, 'one failure, one success');
+});
+
+test('a registry that stays down degrades coverage instead of failing the build', async () => {
+  // Fails past the retry limit, so this source is genuinely lost.
+  const built = await buildTable(flakyFetch(99));
+
+  assert.equal(built.sources, 0);
+  assert.equal(built.v4.length, 0);
+});
+
+test('the number of registries that answered survives into the cache', () => {
+  const table = pack(parseDelegations(ONE_ROW));
+  assert.equal(deserialise(serialise(table, 4)).sources, 4);
+  assert.equal(deserialise(serialise(table, 5)).sources, 5);
 });
 
 test('an allocation running past the end of the address space is dropped', () => {
