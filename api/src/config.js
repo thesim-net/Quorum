@@ -70,7 +70,12 @@ export const config = {
   // below turns any other value into a hard boot failure.
   devAuthBypass: process.env.DEV_AUTH_BYPASS === '1' && process.env.NODE_ENV === 'development',
 
-  geoipDbPath: process.env.GEOIP_DB_PATH ?? '',
+  // Country lookup is built from the RIRs' own delegation statistics and
+  // cached here. Set GEO_DATA_DIR empty to switch location metrics off.
+  geoDataDir: process.env.GEO_DATA_DIR ?? '/data/geoip',
+  // How long a compiled range table is considered current. Registries
+  // publish daily; weekly is ample for country granularity.
+  geoRefreshDays: Number(process.env.GEO_REFRESH_DAYS ?? 7),
   // Local directory holding uploaded file answers.
   uploadsDir: process.env.UPLOADS_DIR ?? '/data/uploads',
   // Update checking (UPDATE_CHECK, UPDATE_CHECK_REPO) is read directly from the

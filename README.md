@@ -52,7 +52,7 @@ A pass proves the image was built by this repo's release workflow from that comm
 
 - **Respondent identity is pseudonymous by default.** Each response stores `HMAC(per-survey key, pepper + respondent id)`, where the respondent id is a random value in a signed browser cookie; a signed-in account is only linked when the survey has "record username" enabled. The key is per survey, so responses cannot be correlated across surveys.
 - **Rotating a survey's respondent key permanently detaches its responses from their authors.** This is the deletion primitive.
-- **IP addresses are never stored.** Country, when collected, is resolved in-process at submit time and only the two-letter code is kept.
+- **IP addresses are never stored.** Country, when collected, is resolved at submit time against a lookup table held on your own server, and only the two-letter code is kept. No per-visitor query is made to anyone. That table is compiled from the regional internet registries' published allocation lists, which are public files containing no personal data; downloading them is the only outbound request Quorum makes, it happens weekly, and it says nothing about who visited. Resolution is to the country an address block is registered to, which is approximate by nature and is not used for access control.
 - **Every collection toggle is disclosed to the participant** on the survey intro screen before they answer anything.
 - **No third-party requests.** A strict Content-Security-Policy allows only the site's own origin and Discord's CDN for avatars.
 - **Stored Discord credentials and 2FA secrets are encrypted at rest** with a key derived from `SESSION_SECRET`.

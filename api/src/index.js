@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 
 import { config } from './config.js';
+import { warmGeo } from './lib/geo.js';
 import { migrate } from './db/migrate.js';
 import { pool } from './db/pool.js';
 import { adminRouter } from './routes/admin.js';
@@ -113,6 +114,10 @@ async function start() {
   // can reach a route that reads Discord credentials.
   await loadSettings();
   await ensureSetupTokenIfNeeded();
+
+  // Compile the country ranges in the background so the first response of
+  // the day is not the one that pays for it.
+  warmGeo();
 
   const server = app.listen(config.port, () => {
     console.log(`Quorum API listening on :${config.port}`);

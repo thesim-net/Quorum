@@ -1,37 +1,54 @@
-import { open } from 'maxmind';
 import { config } from '../config.js';
+import { countryOfIp, loadTable } from './rir.js';
 
 /**
  * Country lookup for the optional location metric.
  *
- * Resolution happens entirely in-process against a local MaxMind database - no
- * request ever leaves the host - and only the two-letter country code is
- * returned. The caller never persists the address it passed in.
+ * Resolution happens entirely in-process against a table compiled from the
+ * RIRs' own delegation statistics - no request carrying a visitor's address
+ * ever leaves the host - and only the two-letter country code is returned. The
+ * caller never persists the address it passed in.
  */
 
-let reader = null;
-let loadAttempted = false;
+let table = null;
+let loading = null;
 
 /**
- * Opens the GeoIP database, once, on first use.
+ * Loads the range table once, in the background.
  *
- * A missing or unreadable database is not fatal: location collection simply
- * yields null, so a deployment that has not downloaded GeoLite2 still runs.
+ * Building it means fetching several megabytes from five registries, so the
+ * first requests after a cold start must not sit and wait for it. They resolve
+ * to null (recorded as unknown) and later requests get real answers. That is a
+ * better trade than making a respondent watch a survey page hang.
  *
- * @returns {Promise<object|null>} maxmind reader, or null when unavailable.
+ * @returns {Promise<object|null>}
  */
-async function getReader() {
-  if (loadAttempted) return reader;
-  loadAttempted = true;
+function ensureTable() {
+  if (table) return Promise.resolve(table);
+  if (loading) return loading;
 
-  if (!config.geoipDbPath) return null;
-  try {
-    reader = await open(config.geoipDbPath);
-  } catch (error) {
-    console.warn(`GeoIP database unavailable (${error.message}); location metrics disabled.`);
-    reader = null;
-  }
-  return reader;
+  loading = loadTable(config.geoDataDir, config.geoRefreshDays)
+    .then((loaded) => {
+      table = loaded;
+      if (loaded) {
+        console.log(
+          `Country ranges ready: ${loaded.v4.start.length} IPv4 and ` +
+            `${loaded.v6.start.length} IPv6 allocations.`,
+        );
+      }
+      return loaded;
+    })
+    .catch((error) => {
+      console.warn(`Country ranges unavailable (${error.message}); location metrics disabled.`);
+      return null;
+    });
+
+  return loading;
+}
+
+/** Kicks off the load without blocking anything. Called once at startup. */
+export function warmGeo() {
+  if (config.geoDataDir) void ensureTable();
 }
 
 /**
@@ -62,19 +79,15 @@ export function clientIp(req) {
  *
  * @param {import('express').Request} req
  * @returns {Promise<string|null>} ISO 3166-1 alpha-2 code, or null when the
- *   address is private, unresolvable, or no database is installed.
+ *   address is private, unresolvable, or the table is not loaded yet.
  */
 export async function countryOf(req) {
-  const db = await getReader();
-  if (!db) return null;
+  if (!config.geoDataDir) return null;
 
-  const ip = clientIp(req);
-  if (!ip) return null;
+  // Never wait on the table. If it is still compiling, this response is simply
+  // recorded without a country.
+  const ranges = table ?? (loading ? null : await ensureTable());
+  if (!ranges) return null;
 
-  try {
-    const result = db.get(ip);
-    return result?.country?.iso_code ?? result?.registered_country?.iso_code ?? null;
-  } catch {
-    return null;
-  }
+  return countryOfIp(ranges, clientIp(req));
 }
