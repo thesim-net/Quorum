@@ -12,11 +12,19 @@ on:
 # statement for each published image, tying its digest to this repo, this
 # commit, and this workflow. Anyone can then verify a pulled image with
 # `gh attestation verify` (see README "Verifying a build").
+#
+# artifact-metadata is the newer half of that: because both attest steps push
+# to the registry, each one also writes a storage record saying where the image
+# is hosted and whether it is still active. Without the scope the signing still
+# succeeds and only the record fails, which is why v1.6.2 published correctly
+# while warning about it - but a warning is a deprecation notice with a delay
+# on it, and this is cheaper to grant now than to diagnose during a release.
 permissions:
   contents: write
   packages: write
   id-token: write
   attestations: write
+  artifact-metadata: write
 
 jobs:
   publish:
