@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api.js';
 import { TotpQr } from '../components/TotpQr.jsx';
@@ -564,6 +564,11 @@ function AutoUpdate() {
   const [error, setError] = useState(null);
   const [status, setStatus] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [restarting, setRestarting] = useState(null);
+  const pollRef = useRef(null);
+
+  // The poll outlives the click that started it.
+  useEffect(() => () => clearInterval(pollRef.current), []);
 
   const load = () =>
     api('/admin/update/auto')
@@ -599,6 +604,40 @@ function AutoUpdate() {
     }
   };
 
+  /**
+   * Waits for the new version to answer, then reloads. Polled rather than
+   * reloaded blindly, since a container still coming up serves an error page.
+   */
+  const watchForRestart = (version) => {
+    setRestarting(version);
+    pollRef.current = setInterval(() => {
+      api('/version')
+        .then((v) => {
+          if (v.version && v.version === version) window.location.reload();
+        })
+        .catch(() => {});
+    }, 3000);
+  };
+
+  /** Restarts into a version already downloaded. */
+  const applyNow = async () => {
+    setBusy(true);
+    setError(null);
+    setStatus(null);
+    try {
+      const result = await api('/admin/update/apply', { method: 'POST' });
+      if (result.status !== 'restarting') {
+        setError(result.message ?? `Could not restart: ${result.status}.`);
+        return;
+      }
+      watchForRestart(result.version);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   /** Downloads now, outside the schedule. */
   const download = async () => {
     setBusy(true);
@@ -607,6 +646,15 @@ function AutoUpdate() {
     try {
       const result = await api('/admin/update/download', { method: 'POST' });
       await load();
+
+      // With auto-restart on the server restarts as part of the same call, so
+      // say which of the two happened rather than always asking for a restart.
+      if (result.status === 'downloaded' && result.applied) {
+        if (result.applied.status === 'restarting') return watchForRestart(result.version);
+        setError(result.applied.message ?? 'Downloaded, but the restart did not start.');
+        return;
+      }
+
       setStatus(
         {
           downloaded: `Version ${result.version} downloaded. Restart to apply it.`,
@@ -638,6 +686,29 @@ function AutoUpdate() {
       <h2>Automatic updates</h2>
       {error ? <div className="error">{error}</div> : null}
       {status ? <p className="muted">{status}</p> : null}
+
+      {restarting ? (
+        <p className="muted">
+          Quorum is restarting into {restarting}. This page reloads once it answers again.
+        </p>
+      ) : null}
+
+      {state.stagedVersion && !restarting ? (
+        <div className="row" style={{ gap: '0.6rem', marginBottom: '0.8rem' }}>
+          <span>
+            <strong>Quorum {state.stagedVersion} is downloaded</strong> and waiting on this host.
+            <br />
+            <span className="muted" style={{ fontSize: '0.82rem' }}>
+              Restarting interrupts anyone part-way through a survey, and runs migrations on the
+              way back up.
+            </span>
+          </span>
+          <span style={{ marginLeft: 'auto' }} />
+          <button type="button" className="primary" disabled={busy} onClick={applyNow}>
+            Upgrade and restart Quorum
+          </button>
+        </div>
+      ) : null}
 
       {!state.dockerAvailable ? (
         <div className="error">

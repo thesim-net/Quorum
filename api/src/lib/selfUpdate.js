@@ -1,9 +1,7 @@
-import { readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { query } from '../db/pool.js';
 import { loadSettings } from './settings.js';
 import { updateStatus, parseSemver } from './update.js';
-import { DockerError, dockerAvailable, imagePresent, pullImage, runDetached } from './docker.js';
+import { dockerAvailable, imagePresent, pullImage, runDetached } from './docker.js';
 
 /**
  * Fetching a new version, and restarting into it.
@@ -107,29 +105,6 @@ export async function pullUpdate() {
 }
 
 /**
- * Rewrites QUORUM_VERSION in the compose project's `.env`. Without it the stack
- * comes back up on whatever it already pinned. One line is replaced in place,
- * so nothing else in the file is touched.
- *
- * @param {string} version The version to pin.
- * @returns {Promise<void>}
- */
-async function pinVersion(version) {
-  const dir = composeDir();
-  if (!dir) throw new DockerError('QUORUM_COMPOSE_DIR is not set, so the version cannot be pinned.');
-
-  const path = join(dir, '.env');
-  const original = await readFile(path, 'utf8');
-
-  const line = `QUORUM_VERSION=${version}`;
-  const updated = /^QUORUM_VERSION=.*$/m.test(original)
-    ? original.replace(/^QUORUM_VERSION=.*$/m, line)
-    : `${original.replace(/\n?$/, '\n')}${line}\n`;
-
-  await writeFile(path, updated, 'utf8');
-}
-
-/**
  * Restarts into a downloaded version, via a detached container that outlives
  * this one. Success means the updater started, not that the upgrade finished -
  * the new API clears the staged marker on boot, which is the real confirmation.
@@ -167,10 +142,21 @@ export async function applyUpdate(requested = null) {
   }
 
   try {
-    await pinVersion(version);
     await runDetached({
       image: updaterImage(),
-      cmd: ['docker', 'compose', 'up', '-d'],
+      // The version is pinned by the updater rather than here: a compose
+      // project's .env is typically 0600 root, and this container is not root.
+      // It also goes in the environment, which compose prefers over .env, so
+      // the right version starts even if the file cannot be written at all.
+      cmd: [
+        'sh',
+        '-c',
+        `if grep -q '^QUORUM_VERSION=' .env 2>/dev/null; then ` +
+          `sed -i 's/^QUORUM_VERSION=.*/QUORUM_VERSION=${version}/' .env; ` +
+          `else echo 'QUORUM_VERSION=${version}' >> .env; fi; ` +
+          `docker compose up -d`,
+      ],
+      env: [`QUORUM_VERSION=${version}`],
       binds: [
         `${process.env.DOCKER_SOCKET ?? '/var/run/docker.sock'}:/var/run/docker.sock`,
         `${process.env.QUORUM_COMPOSE_HOST_DIR ?? composeDir()}:/project`,
