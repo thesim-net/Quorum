@@ -8,6 +8,7 @@ import {
   saveAsciiAnimationDefault,
   saveAuthMethods,
   savePlugins,
+  saveAutoUpdate,
   saveRequire2faAllAdmins,
 } from '../lib/settings.js';
 import {
@@ -27,6 +28,14 @@ import {
   sanitisePlugins,
 } from '../lib/plugins.js';
 import { updateStatus } from '../lib/update.js';
+import {
+  MIN_INTERVAL_SECONDS,
+  describeInterval,
+  toParts,
+  validateSchedule,
+} from '../lib/autoUpdate.js';
+import { applyUpdate, autoUpdateState, pullUpdate } from '../lib/selfUpdate.js';
+import { dockerAvailable } from '../lib/docker.js';
 import { requireAdmin, requireGroupAdmin, requirePanel } from '../middleware/session.js';
 import {
   ALL_PERMISSIONS,
@@ -91,6 +100,93 @@ adminRouter.get('/update', requireAdmin, async (req, res, next) => {
     res.json(await updateStatus(req.query.refresh === '1'));
   } catch (error) {
     next(error);
+  }
+});
+
+/**
+ * Reports the automatic update schedule and whether it could actually run.
+ *
+ * `dockerAvailable` is reported rather than assumed so the settings page can
+ * say the socket is not mounted up front, instead of accepting a schedule that
+ * would fail silently every time it fired.
+ */
+adminRouter.get('/update/auto', requireAdmin, async (_req, res, next) => {
+  try {
+    const state = await autoUpdateState();
+    return res.json({
+      ...state,
+      ...toParts(state.intervalSeconds),
+      cadence: describeInterval(state.intervalSeconds),
+      minimumSeconds: MIN_INTERVAL_SECONDS,
+      dockerAvailable: await dockerAvailable(),
+      composeConfigured: Boolean(process.env.QUORUM_COMPOSE_DIR),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/** Sets the automatic update schedule. */
+adminRouter.put('/update/auto', requireAdmin, async (req, res, next) => {
+  try {
+    const enabled = req.body?.enabled === true;
+    const restart = req.body?.restart === true;
+
+    const checked = validateSchedule({
+      enabled,
+      days: req.body?.days,
+      hours: req.body?.hours,
+      seconds: req.body?.seconds,
+    });
+    if (!checked.ok) return res.status(400).json({ error: checked.error });
+
+    await saveAutoUpdate({ enabled, intervalSeconds: checked.seconds, restart });
+    await audit(req.user.id, 'auto_update.update', 'settings', 'app_settings', {
+      enabled,
+      intervalSeconds: checked.seconds,
+      restart,
+    });
+
+    const state = await autoUpdateState();
+    return res.json({ ok: true, ...state, cadence: describeInterval(state.intervalSeconds) });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * Downloads the newest version now, without restarting.
+ *
+ * The ordinary outcomes - already current, no socket, download failed - come
+ * back as a status rather than an error, because each is something the page
+ * should say plainly rather than a red banner.
+ */
+adminRouter.post('/update/download', requireAdmin, async (req, res, next) => {
+  try {
+    const result = await pullUpdate();
+    await audit(req.user.id, 'auto_update.download', 'settings', 'app_settings', result);
+    return res.json(result);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * Restarts the deployment into a version already downloaded.
+ *
+ * Answers as soon as the updater container is started, because moments later
+ * this process is stopped by it. "restarting" therefore means the handover
+ * began, not that it finished - the new API clears the staged marker on boot,
+ * and that is the real confirmation.
+ */
+adminRouter.post('/update/apply', requireAdmin, async (req, res, next) => {
+  try {
+    await audit(req.user.id, 'auto_update.apply', 'settings', 'app_settings', {
+      version: req.body?.version ?? null,
+    });
+    return res.json(await applyUpdate(req.body?.version ?? null));
+  } catch (error) {
+    return next(error);
   }
 });
 

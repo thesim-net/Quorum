@@ -16,6 +16,7 @@ import { twofactorAdminRouter, twofactorAuthRouter } from './plugins/twofactor/r
 import { loadSession } from './middleware/session.js';
 import { ensureSetupTokenIfNeeded, loadSettings, current } from './lib/settings.js';
 import { startScheduler } from './lib/scheduler.js';
+import { clearStagedIfRunning } from './lib/selfUpdate.js';
 import { VERSION, GIT_SHA, BUILD_TIME, REPO } from './lib/version.js';
 import { attestationStatus } from './lib/attestation.js';
 import { classifyPlugins } from './lib/plugins.js';
@@ -114,6 +115,13 @@ async function start() {
   // can reach a route that reads Discord credentials.
   await loadSettings();
   await ensureSetupTokenIfNeeded();
+
+  // An upgrade that was staged and applied is only confirmed by this process
+  // existing: the updater container's last act is to stop the API that would
+  // otherwise have reported success, so the new one clears the marker itself.
+  await clearStagedIfRunning(VERSION).catch((error) =>
+    console.warn(`Could not clear the staged version: ${error.message}`),
+  );
 
   // Compile the country ranges in the background so the first response of
   // the day is not the one that pays for it.
