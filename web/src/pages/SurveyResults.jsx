@@ -4,21 +4,8 @@ import { api, downloadExport } from '../api.js';
 import { QuestionChart } from '../charts/QuestionChart.jsx';
 import { TextResponses } from '../components/TextResponses.jsx';
 import { FileResponses } from '../components/FileResponses.jsx';
-
-/**
- * Renders a duration in the largest sensible unit.
- *
- * @param {number|null} ms Milliseconds.
- * @returns {string} Formatted duration, or a dash when there is nothing to show.
- */
-function duration(ms) {
-  if (!ms && ms !== 0) return '-';
-  const seconds = Math.round(ms / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
-  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
-}
+import { buildFilter } from '../lib/answerFilters.js';
+import { duration } from '../lib/format.js';
 
 /**
  * A single headline metric.
@@ -76,6 +63,10 @@ export function SurveyResults() {
   const [viewingFiles, setViewingFiles] = useState(null);
   const [winner, setWinner] = useState(null);
   const [drawing, setDrawing] = useState(false);
+  // Which questions have their full answer list open. Collapsed by default:
+  // the chart is the summary, and the full list is what you open when the
+  // summary is not enough.
+  const [expanded, setExpanded] = useState(() => new Set());
 
   /** Draws a raffle winner from the completed responses. */
   const draw = async () => {
@@ -102,6 +93,20 @@ export function SurveyResults() {
 
   const { survey, metrics, countries, questions } = data;
 
+  /**
+   * Shows or hides one question's full answer list.
+   *
+   * @param {string} questionId
+   * @returns {void}
+   */
+  const toggleExpanded = (questionId) =>
+    setExpanded((previous) => {
+      const next = new Set(previous);
+      if (next.has(questionId)) next.delete(questionId);
+      else next.add(questionId);
+      return next;
+    });
+
   return (
     <div className="shell">
       <p>
@@ -120,6 +125,16 @@ export function SurveyResults() {
             <Stat label="Total time spent" value={duration(metrics.totalTimeMs)} />
           </>
         ) : null}
+      </div>
+
+      <div className="card">
+        <div className="row">
+          <strong>Responses</strong>
+          <Link to={`/admin/surveys/${id}/responses`}>Read them one by one</Link>
+          <span className="muted" style={{ fontSize: '0.82rem' }}>
+            Every respondent's full set of answers, narrowable by what they chose.
+          </span>
+        </div>
       </div>
 
       <div className="card">
@@ -269,6 +284,53 @@ export function SurveyResults() {
               ) : null}
             </>
           )}
+
+          {question.offered ? (
+            <div className="chart-foot">
+              <button type="button" onClick={() => toggleExpanded(question.id)}>
+                {expanded.has(question.id)
+                  ? 'Hide every answer'
+                  : `Show all ${question.offered.length} answers`}
+              </button>
+            </div>
+          ) : null}
+
+          {question.offered && expanded.has(question.id) ? (
+            // The chart can only draw what people chose. This lists what the
+            // question OFFERED, so an answer nobody picked shows as a zero
+            // rather than being missing - which for a scenario question is
+            // usually the thing worth knowing.
+            <table className="chart-table">
+              <thead>
+                <tr>
+                  <th scope="col">Answer</th>
+                  <th scope="col">Chose it</th>
+                  <th scope="col">Who</th>
+                </tr>
+              </thead>
+              <tbody>
+                {question.offered.map((option) => (
+                  <tr key={option.key}>
+                    <th scope="row">{option.label}</th>
+                    <td>{option.count}</td>
+                    <td>
+                      {option.count > 0 ? (
+                        <Link
+                          to={`/admin/surveys/${id}/responses?answer=${encodeURIComponent(
+                            buildFilter(question.id, option.key),
+                          )}`}
+                        >
+                          List them
+                        </Link>
+                      ) : (
+                        <span className="muted">Nobody</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : null}
 
           {question.skipped ? (
             <p className="muted" style={{ fontSize: '0.82rem' }}>

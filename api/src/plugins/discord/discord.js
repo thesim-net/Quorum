@@ -140,6 +140,36 @@ export async function guildMember(discordId) {
 }
 
 /**
+ * Lists every member of the configured guild.
+ *
+ * Unlike `guildMember`, this needs the GUILD_MEMBERS privileged intent enabled
+ * on the application, so it is never on a request path - a survey that only has
+ * to check one person uses the single-member lookup, which does not. It exists
+ * for offline work over the whole roster, where the alternative is having no
+ * candidate set at all.
+ *
+ * Paged by ascending user id, which is what `after` walks; a short page means
+ * the end.
+ *
+ * @param {number} pageSize Members per call, Discord's maximum being 1000.
+ * @returns {Promise<object[]>} Every guild member object.
+ */
+export async function guildMembers(pageSize = 1000) {
+  const guildId = requireDiscord().guildId;
+  const members = [];
+  let after = '0';
+
+  for (;;) {
+    const page = await bot(`/guilds/${guildId}/members?limit=${pageSize}&after=${after}`);
+    if (!Array.isArray(page) || page.length === 0) return members;
+
+    members.push(...page);
+    if (page.length < pageSize) return members;
+    after = page[page.length - 1].user.id;
+  }
+}
+
+/**
  * Fetches the guild, including its owner id.
  *
  * @returns {Promise<object>} Discord guild object.

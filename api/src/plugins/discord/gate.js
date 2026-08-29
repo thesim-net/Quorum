@@ -81,17 +81,32 @@ export const cachedGuildName = () => cache?.value.guild.name ?? null;
  * ten gated surveys costs one call rather than ten, while someone who leaves
  * the server loses access within the minute.
  *
+ * The member's name is carried alongside their roles because the same response
+ * already contains it. A survey that collects identity records it against the
+ * response; the gate itself never reads it, and nothing here is persisted.
+ *
  * @param {string} discordId
  * @param {boolean} force Bypass the TTL.
- * @returns {Promise<{discordId: string, roleIds: string[]}|null>} The member, or
- *   null when they are not in the server.
+ * @returns {Promise<{discordId: string, roleIds: string[], username: string|null,
+ *   displayName: string|null}|null>} The member, or null when they are not in
+ *   the server.
  */
 export async function guildMembership(discordId, force = false) {
   const hit = memberCache.get(discordId);
   if (!force && hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.value;
 
   const member = await discord.guildMember(discordId);
-  const value = member ? { discordId, roleIds: member.roles ?? [] } : null;
+  const value = member
+    ? {
+        discordId,
+        roleIds: member.roles ?? [],
+        username: member.user?.username ?? null,
+        // The server nickname is what other members actually see, so it wins;
+        // the global display name is the next best, and a bare handle is the
+        // floor.
+        displayName: member.nick ?? member.user?.global_name ?? null,
+      }
+    : null;
 
   if (memberCache.size >= MEMBER_CACHE_MAX) memberCache.clear();
   memberCache.set(discordId, { at: Date.now(), value });

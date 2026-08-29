@@ -6,7 +6,7 @@ import { visibleQuestions } from '../lib/conditional.js';
 import { PLUGINS, isPluginEnabled } from '../lib/plugins.js';
 import { current } from '../lib/settings.js';
 import { countryOf } from '../lib/geo.js';
-import { respondentHash, respondentIdentity } from '../lib/respondent.js';
+import { recordsIdentity, respondentHash, respondentIdentity } from '../lib/respondent.js';
 import {
   START,
   allowsRepeat,
@@ -192,6 +192,49 @@ async function loadAccessibleSurvey(slug, req) {
  */
 const identityFor = (survey, req) =>
   respondentIdentity(survey, { cookieId: req.respondentId, discordId: discordIdOf(req) });
+
+/** What is recorded when a survey collects no identity, or cannot know one. */
+const NO_IDENTITY = { discordId: null, username: null, displayName: null };
+
+/**
+ * The Discord profile to store against a new response.
+ *
+ * Answers "does this survey both want a name and actually know one", which are
+ * two separate questions. Wanting it is `collect_identity`. Knowing it needs the
+ * survey to be gated on the guild: an ungated survey identifies its respondents
+ * by a random browser cookie and has no name behind it, so it records none, and
+ * a respondent who happens to be a signed-in admin is still covered by
+ * `user_id` on the row.
+ *
+ * The lookup is a cache hit in practice - the gate resolved this same member a
+ * moment ago on this request - and a miss is not worth failing a submission
+ * over, so an unreachable Discord costs the name, not the response.
+ *
+ * @param {object} survey Survey row, gated by `withGating`.
+ * @param {import('express').Request} req The request, for its identities.
+ * @returns {Promise<{discordId: string|null, username: string|null,
+ *   displayName: string|null}>} What to write to the identity columns.
+ */
+async function recordedIdentity(survey, req) {
+  if (!recordsIdentity(survey)) return NO_IDENTITY;
+
+  const discordId = discordIdOf(req);
+  if (!discordId) return NO_IDENTITY;
+
+  try {
+    const member = await guildMembership(discordId);
+    if (!member) return NO_IDENTITY;
+    return {
+      discordId,
+      username: member.username,
+      displayName: member.displayName,
+    };
+  } catch {
+    // The id is still worth keeping: it is the durable half, and a name can be
+    // resolved from it later.
+    return { ...NO_IDENTITY, discordId };
+  }
+}
 
 /**
  * Finds the response the caller is currently working on, if any.
@@ -379,23 +422,33 @@ surveyRouter.post('/:slug/start', async (req, res, next) => {
       const country = survey.collect_location ? await countryOf(req) : null;
 
       // An account is linked only when the survey declares it and the caller
-      // is actually signed in; anonymous respondents stay anonymous.
+      // is actually signed in; anonymous respondents stay anonymous. That alone
+      // never covered a gated survey's participants, who are not accounts and
+      // never will be - `recordedIdentity` is what names them, on the response
+      // rather than in `users`.
       //
       // `exclusive` mirrors the survey's one-per-person setting: on, and the
       // partial unique index refuses a second row for this respondent, which is
       // what makes two simultaneous starts safe without a lock. Off, and the
       // row is outside the index entirely.
+      const named = await recordedIdentity(survey, req);
+
       let created;
       try {
         const { rows } = await query(
-          `INSERT INTO responses (survey_id, respondent_hash, user_id, country_code, exclusive)
-           VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+          `INSERT INTO responses (survey_id, respondent_hash, user_id, country_code, exclusive,
+                                  respondent_discord_id, respondent_username,
+                                  respondent_display_name)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
           [
             survey.id,
             respondentHash(survey.respondent_key, identity),
             survey.collect_identity && req.user ? req.user.id : null,
             country,
             oneResponsePerPerson(survey),
+            named.discordId,
+            named.username,
+            named.displayName,
           ],
         );
         created = rows[0];

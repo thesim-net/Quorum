@@ -55,6 +55,28 @@ export function respondentIdentity(survey, { cookieId, discordId }) {
 }
 
 /**
+ * Whether a response should carry the name of the person who gave it.
+ *
+ * Two conditions, and both are load-bearing. `collect_identity` is the survey
+ * saying it wants one, and is what the participant was shown before they
+ * answered. Gating is the survey being in a position to know one: an ungated
+ * survey identifies respondents by a random browser cookie, so there is no name
+ * behind it and recording one would mean inventing it.
+ *
+ * This is deliberately not "is someone signed in". Reading it that way is what
+ * left `collect_identity` surveys with empty usernames: a respondent on a gated
+ * survey holds a proved Discord identity and no account at all, so any test
+ * that goes looking for a session finds nothing and records nothing.
+ *
+ * @param {object} survey Survey row, with `require_guild` derived from its
+ *   groups.
+ * @returns {boolean} True when the identity columns should be written.
+ */
+export function recordsIdentity(survey) {
+  return Boolean(survey?.collect_identity) && requiresGuild(survey);
+}
+
+/**
  * Constant-time comparison of two respondent hashes.
  *
  * @param {Buffer} a

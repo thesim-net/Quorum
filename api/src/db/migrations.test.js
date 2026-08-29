@@ -23,6 +23,7 @@ const GUILD_GATE = migration('013_guild_gate.sql');
 const DROP_USER_PERMISSIONS = migration('014_drop_user_permissions.sql');
 const GROUP_ADMINS = migration('015_group_admins.sql');
 const SURVEY_GROUPS = migration('016_survey_groups.sql');
+const RESPONDENT_IDENTITY = migration('017_respondent_identity.sql');
 
 test('013 adds the guild gate switched off, so nothing becomes gated by surprise', () => {
   assert.match(
@@ -186,4 +187,28 @@ test('016 leaves responses and answers untouched', () => {
   // between groups must never disturb a response already given.
   assert.doesNotMatch(SURVEY_GROUPS, /\bresponses\b/);
   assert.doesNotMatch(SURVEY_GROUPS, /\banswers\b/);
+});
+
+test('017 adds the respondent identity columns nullable, so existing responses stay as they are', () => {
+  // Every response already given was taken under a survey that recorded no
+  // name, and there is no name to backfill: the respondent hash is an HMAC and
+  // cannot be reversed. NOT NULL or a DEFAULT here would either fail the
+  // migration or invent an author.
+  assert.match(RESPONDENT_IDENTITY, /ADD COLUMN respondent_discord_id\s+text,/);
+  assert.match(RESPONDENT_IDENTITY, /ADD COLUMN respondent_username\s+text,/);
+  assert.match(RESPONDENT_IDENTITY, /ADD COLUMN respondent_display_name\s+text;/);
+  assert.doesNotMatch(RESPONDENT_IDENTITY, /respondent_(discord_id|username|display_name)[^,;]*NOT NULL/);
+  assert.doesNotMatch(RESPONDENT_IDENTITY, /respondent_(discord_id|username|display_name)[^,;]*DEFAULT/);
+});
+
+test('017 does not make the recorded Discord id a foreign key', () => {
+  // It names a Discord account, not a Quorum one. A respondent deliberately has
+  // no users row, so a reference here would have nothing to point at and would
+  // reintroduce the account-shaped assumption this migration exists to remove.
+  assert.doesNotMatch(RESPONDENT_IDENTITY, /respondent_discord_id[^,;]*REFERENCES/);
+});
+
+test('017 backfills nothing and touches no answer', () => {
+  // Purely additive. Rewriting responses here would be rewriting history.
+  assert.doesNotMatch(RESPONDENT_IDENTITY, /UPDATE|INSERT|DELETE|DROP/);
 });

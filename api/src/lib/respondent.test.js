@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { respondentHash, respondentIdentity } from './respondent.js';
+import { recordsIdentity, respondentHash, respondentIdentity } from './respondent.js';
 
 // The pepper is read from the environment on each call, so it is set here
 // rather than requiring a whole runtime configuration to hash anything.
@@ -52,4 +52,32 @@ test('the same Discord account hashes differently in every survey', () => {
 test('the hash is stable for the same person and survey', () => {
   assert.deepEqual(respondentHash(KEY_A, DISCORD_ID), respondentHash(KEY_A, DISCORD_ID));
   assert.equal(respondentHash(KEY_A, DISCORD_ID).length, 32);
+});
+
+test('a gated survey that collects identity records the name behind the response', () => {
+  assert.equal(recordsIdentity({ ...gated, collect_identity: true }), true);
+});
+
+test('a survey that collects no identity records none, gated or not', () => {
+  assert.equal(recordsIdentity({ ...gated, collect_identity: false }), false);
+  assert.equal(recordsIdentity({ ...anonymous, collect_identity: false }), false);
+});
+
+test('an anonymous survey records no name even when it asks for identity', () => {
+  // It counts browsers, so there is no person behind the hash to name. This is
+  // the case where recording something would mean inventing it.
+  assert.equal(recordsIdentity({ ...anonymous, collect_identity: true }), false);
+});
+
+test('the decision never consults a session', () => {
+  // The original bug: identity was written only when `req.user` was set, which
+  // no genuine respondent ever has. Nothing about a signed-in admin may change
+  // the answer here.
+  const survey = { ...gated, collect_identity: true };
+  assert.equal(recordsIdentity(survey), recordsIdentity({ ...survey, user: { id: 'someone' } }));
+});
+
+test('a survey row with nothing on it records nothing rather than throwing', () => {
+  assert.equal(recordsIdentity({}), false);
+  assert.equal(recordsIdentity(null), false);
 });

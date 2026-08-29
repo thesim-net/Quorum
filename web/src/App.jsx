@@ -19,6 +19,12 @@ const SurveyEditor = lazy(() =>
 const SurveyResults = lazy(() =>
   import('./pages/SurveyResults.jsx').then((m) => ({ default: m.SurveyResults })),
 );
+const SurveyRespondents = lazy(() =>
+  import('./pages/SurveyRespondents.jsx').then((m) => ({ default: m.SurveyRespondents })),
+);
+const SurveyResponse = lazy(() =>
+  import('./pages/SurveyRespondents.jsx').then((m) => ({ default: m.SurveyResponse })),
+);
 const AdminSettings = lazy(() =>
   import('./pages/AdminSettings.jsx').then((m) => ({ default: m.AdminSettings })),
 );
@@ -449,6 +455,11 @@ export function App() {
                   layout rather than under it. */}
               <Route path="/admin/surveys/:id" element={<SurveyEditor />} />
               <Route path="/admin/surveys/:id/results" element={<SurveyResults />} />
+              <Route path="/admin/surveys/:id/responses" element={<SurveyRespondents />} />
+              <Route
+                path="/admin/surveys/:id/responses/:responseId"
+                element={<SurveyResponse />}
+              />
               {/* Linking Discord from Settings lands back here, the same page
                   the forced step uses, so both routes finish the same way. */}
               <Route path="/admin/link-discord" element={<LinkDiscordPage />} />
