@@ -1,6 +1,7 @@
 import { query } from '../db/pool.js';
 import { loadSettings } from './settings.js';
-import { updateStatus, parseSemver } from './update.js';
+import { updateStatus, parseSemver, isNewer } from './update.js';
+import { VERSION } from './version.js';
 import { dockerAvailable, imagePresent, pullImage, runDetached } from './docker.js';
 
 /**
@@ -117,6 +118,16 @@ export async function applyUpdate(requested = null) {
   const version = requested ?? state.stagedVersion;
 
   if (!version) return { status: 'nothing-staged' };
+
+  // Never restart into something older. The route accepts an explicit version,
+  // and a stale marker is exactly how a downgrade would get requested.
+  if (!isNewer(version, VERSION)) {
+    return {
+      status: 'not-newer',
+      message: `Quorum is already running ${VERSION}, which is not older than ${version}.`,
+    };
+  }
+
   if (!(await dockerAvailable())) {
     return {
       status: 'unavailable',
@@ -173,17 +184,30 @@ export async function applyUpdate(requested = null) {
 }
 
 /**
- * Clears the staged marker at boot, once this process IS that version. The
- * updater cannot report success: its last act is to stop the listener.
+ * Clears the staged marker at boot unless it still names something newer.
+ *
+ * The updater cannot report its own success - its last act is to stop the
+ * listener - so the new version confirms the upgrade by existing.
+ *
+ * Tested for "not newer" rather than "equal" because a deployment can arrive at
+ * a version by other means: staging 1.6.4 and then updating to 1.6.5 by hand
+ * leaves a marker that, matched on equality, would sit there offering to
+ * restart into an older release.
  *
  * @param {string} runningVersion The version this process is.
  * @returns {Promise<void>}
  */
 export async function clearStagedIfRunning(runningVersion) {
+  const { rows } = await query(
+    'SELECT auto_update_staged_version AS staged FROM app_settings WHERE id = true',
+  );
+  const staged = rows[0]?.staged ?? null;
+  if (!staged || isNewer(staged, runningVersion)) return;
+
   await query(
     `UPDATE app_settings
         SET auto_update_staged_version = NULL, auto_update_last_error = NULL, updated_at = now()
       WHERE id = true AND auto_update_staged_version = $1`,
-    [runningVersion],
+    [staged],
   );
 }
