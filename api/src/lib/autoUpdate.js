@@ -118,3 +118,28 @@ export function describeInterval(total) {
 
   return `every ${parts.join(', ')}`;
 }
+
+/**
+ * The compose project name a host directory implies.
+ *
+ * Pure, and tested, because getting it wrong does not fail loudly: compose
+ * simply builds a SECOND stack under the wrong name, with its own empty
+ * database, beside the one it was asked to upgrade.
+ *
+ * Mirrors what compose itself does to a directory name - lowercase, and drop
+ * what it will not accept - so the name passed back is the one already in use.
+ *
+ * @param {string|null} hostPath The project directory, as the host knows it.
+ * @returns {string|null} The project name, or null when none can be read.
+ */
+export function projectNameFrom(hostPath) {
+  if (!hostPath) return null;
+
+  // Read as text rather than resolved: this process may never have seen the
+  // path, and it can carry either separator or a trailing one.
+  const parts = String(hostPath).split(/[\\/]+/).filter(Boolean);
+  const name = parts[parts.length - 1];
+  if (!name) return null;
+
+  return name.toLowerCase().replace(/[^a-z0-9_-]/g, '') || null;
+}
