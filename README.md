@@ -52,6 +52,30 @@ No `email`, no `guilds`, no `guilds.members.read`. Membership and roles are read
 
 The bot needs no message content intent, and never reads messages.
 
+### Automatic updates
+
+Quorum can download new versions on a schedule, and restart into them if you ask it to separately. Both are off by default and both need the Docker socket, which is commented out in `docker-compose.yml` — granting it to a public-facing container is granting root on that host, so it is a deliberate step rather than something an upgrade turns on.
+
+Mounting the socket is necessary but **not sufficient**. The API runs as a non-root user and the socket is `root:docker` mode 0660, so the service also needs that group:
+
+```yaml
+  api:
+    group_add:
+      - "991"            # from `getent group docker` on the host
+    environment:
+      QUORUM_COMPOSE_DIR: /compose        # this project, inside the container
+      QUORUM_COMPOSE_HOST_DIR: /opt/quorum  # the same directory, as the host knows it
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/compose
+```
+
+Both paths are needed because the two halves differ: downloading only needs the socket, while restarting also rewrites `QUORUM_VERSION` in the project's `.env` — a deployment that pins a version would otherwise come back up on the one it was already running. The host path is separate because the container that performs the restart is created by the host's daemon, so its mounts resolve against host paths.
+
+Putting this in a `docker-compose.override.yml` rather than editing the shipped file keeps the opt-in to one file you can delete to revoke.
+
+The settings page reports which of these is missing, and the schedule refuses any interval more frequent than twice a day.
+
 ## Updating
 
 The admin page shows a banner when a newer version is published. To update, run `./update.sh` from the folder holding your `docker-compose.yml` (or `docker compose pull && docker compose up -d`). New database migrations run automatically when the new version starts; your data volumes are untouched.

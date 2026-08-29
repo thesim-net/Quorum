@@ -31,3 +31,17 @@ export function when(iso) {
   const date = new Date(iso);
   return Number.isNaN(date.getTime()) ? '-' : date.toLocaleString();
 }
+
+/**
+ * Shortens text to fit a control, with an ellipsis when it is cut.
+ *
+ * @param {string} text
+ * @param {number} max Longest result, ellipsis included.
+ * @returns {string} The text, or its first characters plus a marker.
+ */
+export function truncate(text, max) {
+  const value = String(text ?? '');
+  // The ellipsis is part of the budget, so the result never exceeds `max` -
+  // otherwise a cap meant to fit a control would overshoot it by three.
+  return value.length > max ? `${value.slice(0, max - 3).trimEnd()}...` : value;
+}

@@ -55,6 +55,10 @@ services:
       # Uncomment to let Quorum update itself. The socket is root on the host,
       # so this is opt-in; without it only the update buttons are inert.
       #
+      # The api service also needs group_add with the host's docker gid (see
+      # `getent group docker`) - it runs as a non-root user, and the socket is
+      # root:docker 0660, so a mount on its own gets EACCES.
+      #
       # - /var/run/docker.sock:/var/run/docker.sock
       # - .:/compose
 

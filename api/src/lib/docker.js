@@ -16,28 +16,49 @@ const TIMEOUT_MS = 30_000;
 const PULL_TIMEOUT_MS = 15 * 60 * 1000;
 
 export class DockerError extends Error {
-  constructor(message, status = null) {
+  constructor(message, status = null, code = null) {
     super(message);
     this.name = 'DockerError';
     this.status = status;
+    // The underlying errno, so a caller can tell "no socket here" from "the
+    // socket is there and refused me".
+    this.code = code;
   }
 }
 
 /**
- * Whether this container can reach the Engine, so the settings page can say
- * so up front rather than accepting a schedule that could never run.
+ * Whether this container can reach the Engine, and if not, why.
  *
- * @returns {Promise<boolean>} True when the socket is present and readable.
+ * The reason matters: mounting the socket is necessary but not sufficient. The
+ * API runs as a non-root user and the socket is usually root:docker 0660, so a
+ * mount without `group_add` connects to a socket it can see and cannot use.
+ * Reporting both as "not mounted" sends people to fix the wrong thing.
+ *
+ * @returns {Promise<{available: boolean, reason: string}>} `ok`, `missing`,
+ *   `denied`, or `unreachable`.
  */
-export async function dockerAvailable() {
+export async function dockerStatus() {
   try {
     await access(SOCKET);
-    await engine('GET', '/_ping', { timeout: 5000 });
-    return true;
   } catch {
-    return false;
+    return { available: false, reason: 'missing' };
+  }
+
+  try {
+    await engine('GET', '/_ping', { timeout: 5000 });
+    return { available: true, reason: 'ok' };
+  } catch (error) {
+    const denied = error?.code === 'EACCES' || /EACCES/.test(error?.message ?? '');
+    return { available: false, reason: denied ? 'denied' : 'unreachable' };
   }
 }
+
+/**
+ * Whether the Engine is usable, for callers that do not care why not.
+ *
+ * @returns {Promise<boolean>} True when the socket is present and usable.
+ */
+export const dockerAvailable = async () => (await dockerStatus()).available;
 
 /**
  * Issues one Engine API call over the socket.
@@ -90,7 +111,7 @@ function engine(method, path, { timeout = TIMEOUT_MS, raw = false, body: payload
       req.destroy(new DockerError(`Docker ${method} ${path} timed out`));
     });
     req.on('error', (error) =>
-      reject(error instanceof DockerError ? error : new DockerError(error.message)),
+      reject(error instanceof DockerError ? error : new DockerError(error.message, null, error.code)),
     );
     if (encoded) req.write(encoded);
     req.end();
