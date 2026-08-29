@@ -168,6 +168,15 @@ adminRouter.post('/update/download', requireAdmin, async (req, res, next) => {
   try {
     const result = await pullUpdate();
     await audit(req.user.id, 'auto_update.download', 'settings', 'app_settings', result);
+
+    // Downloading by hand behaves the way the schedule does. With auto-restart
+    // on, stopping at "downloaded" would make the setting mean "restart by
+    // itself, except when you ask for it", which is not what it says.
+    if (result.status === 'downloaded' && (await autoUpdateState()).restart) {
+      const applied = await applyUpdate(result.version);
+      return res.json({ ...result, applied });
+    }
+
     return res.json(result);
   } catch (error) {
     return next(error);
