@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api.js';
 import { TotpQr } from '../components/TotpQr.jsx';
+import { Toggle } from '../components/Toggle.jsx';
 
 /**
  * Change-password form for the signed-in admin's own local account.
@@ -551,9 +552,176 @@ function AsciiAnimationDefault({ value, onChange }) {
   );
 }
 
+
 /**
- * Settings tab: your own account, two-factor, sign-in methods, Discord, and
- * appearance. Managing other admins, groups, and plugins live in their own tabs.
+ * The automatic update schedule, super admins only.
+ *
+ * @returns {JSX.Element|null} The card, or null before the state loads.
+ */
+function AutoUpdate() {
+  const [state, setState] = useState(null);
+  const [form, setForm] = useState(null);
+  const [error, setError] = useState(null);
+  const [status, setStatus] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = () =>
+    api('/admin/update/auto')
+      .then((data) => {
+        setState(data);
+        setForm({
+          enabled: data.enabled,
+          restart: data.restart,
+          days: String(data.days ?? 0),
+          hours: String(data.hours ?? 0),
+          seconds: String(data.seconds ?? 0),
+        });
+      })
+      .catch(() => setState(null));
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  /** Saves the schedule, surfacing the server's refusal rather than repeating it. */
+  const save = async (next) => {
+    setBusy(true);
+    setError(null);
+    setStatus(null);
+    try {
+      await api('/admin/update/auto', { method: 'PUT', body: next });
+      await load();
+      setStatus('Schedule saved.');
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Downloads now, outside the schedule. */
+  const download = async () => {
+    setBusy(true);
+    setError(null);
+    setStatus(null);
+    try {
+      const result = await api('/admin/update/download', { method: 'POST' });
+      await load();
+      setStatus(
+        {
+          downloaded: `Version ${result.version} downloaded. Restart to apply it.`,
+          current: 'Already running the newest version.',
+          unavailable: result.message,
+          failed: result.message,
+        }[result.status] ?? 'Nothing to do.',
+      );
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!state || !form) return null;
+
+  const submit = () =>
+    save({
+      enabled: form.enabled,
+      restart: form.restart,
+      days: form.days,
+      hours: form.hours,
+      seconds: form.seconds,
+    });
+
+  return (
+    <div className="card">
+      <h2>Automatic updates</h2>
+      {error ? <div className="error">{error}</div> : null}
+      {status ? <p className="muted">{status}</p> : null}
+
+      {!state.dockerAvailable ? (
+        <div className="error">
+          Quorum cannot reach the Docker socket, so it cannot download or install updates by
+          itself. Mount <code>/var/run/docker.sock</code> into the API container to enable this.
+        </div>
+      ) : null}
+
+      <Toggle
+        checked={form.enabled}
+        onChange={(enabled) => setForm({ ...form, enabled })}
+        label="Automatically upgrade Quorum"
+        hint="Checks for a new release on a schedule and downloads it."
+      />
+
+      {form.enabled ? (
+        <>
+          <p className="muted" style={{ fontSize: '0.85rem', marginBottom: '0.4rem' }}>
+            How often to check. A new version appears a few times a year, so Quorum will not check
+            more than twice a day however this is filled in.
+          </p>
+
+          <div className="row" style={{ gap: '0.75rem', flexWrap: 'wrap' }}>
+            {['days', 'hours', 'seconds'].map((unit) => (
+              <label key={unit}>
+                <span className="field-label">{unit[0].toUpperCase() + unit.slice(1)}</span>
+                <input
+                  type="number"
+                  min="0"
+                  style={{ width: '6rem' }}
+                  value={form[unit]}
+                  onChange={(e) => setForm({ ...form, [unit]: e.target.value })}
+                />
+              </label>
+            ))}
+          </div>
+
+          <div style={{ marginTop: '0.8rem' }}>
+            <Toggle
+              checked={form.restart}
+              onChange={(restart) => setForm({ ...form, restart })}
+              label="Auto-restart Quorum after update"
+              hint={
+                form.restart
+                  ? 'Quorum will restart itself into the new version. In-progress responses are interrupted and migrations run on the way back up.'
+                  : 'The update is downloaded and left ready. Nothing restarts until you ask it to.'
+              }
+            />
+          </div>
+
+          {form.restart && !state.composeConfigured ? (
+            <div className="error">
+              Restarting also needs <code>QUORUM_COMPOSE_DIR</code> set to the mounted compose
+              project. Without it Quorum can download an update but not apply one.
+            </div>
+          ) : null}
+        </>
+      ) : null}
+
+      <div className="row" style={{ marginTop: '0.9rem' }}>
+        <button type="button" className="primary" disabled={busy} onClick={submit}>
+          {busy ? 'Saving...' : 'Save schedule'}
+        </button>
+        <button type="button" disabled={busy || !state.dockerAvailable} onClick={download}>
+          Check and download now
+        </button>
+        <span className="muted" style={{ fontSize: '0.82rem' }}>
+          {state.enabled ? `Checking ${state.cadence}.` : 'Not checking automatically.'}
+        </span>
+      </div>
+
+      {state.lastError ? (
+        <p className="muted" style={{ fontSize: '0.82rem' }}>
+          Last attempt: {state.lastError}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Settings tab: your own account, two-factor, sign-in methods, automatic
+ * updates, Discord, and appearance. Managing other admins, groups, and plugins
+ * live in their own tabs.
  *
  * @returns {JSX.Element} The page.
  */
@@ -621,6 +789,8 @@ export function AdminSettings() {
           </div>
         </div>
       ) : null}
+
+      {me.isSuperAdmin ? <AutoUpdate /> : null}
 
       {me.isSuperAdmin ? (
         <AsciiAnimationDefault value={asciiDefault} onChange={setAsciiDefault} />

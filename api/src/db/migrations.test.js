@@ -24,6 +24,7 @@ const DROP_USER_PERMISSIONS = migration('014_drop_user_permissions.sql');
 const GROUP_ADMINS = migration('015_group_admins.sql');
 const SURVEY_GROUPS = migration('016_survey_groups.sql');
 const RESPONDENT_IDENTITY = migration('017_respondent_identity.sql');
+const AUTO_UPDATE = migration('018_auto_update.sql');
 
 test('013 adds the guild gate switched off, so nothing becomes gated by surprise', () => {
   assert.match(
@@ -211,4 +212,28 @@ test('017 does not make the recorded Discord id a foreign key', () => {
 test('017 backfills nothing and touches no answer', () => {
   // Purely additive. Rewriting responses here would be rewriting history.
   assert.doesNotMatch(RESPONDENT_IDENTITY, /UPDATE|INSERT|DELETE|DROP/);
+});
+
+test('018 defaults both automatic-update switches off', () => {
+  // No deployment should acquire unattended downloads, or an unattended
+  // restart, by applying a migration.
+  assert.match(AUTO_UPDATE, /ADD COLUMN auto_update_enabled boolean NOT NULL DEFAULT false/);
+  assert.match(AUTO_UPDATE, /ADD COLUMN auto_update_restart boolean NOT NULL DEFAULT false/);
+});
+
+test('018 leaves the interval nullable, so "off" keeps no cadence', () => {
+  // Otherwise re-enabling would resume a schedule nobody was looking at.
+  assert.match(AUTO_UPDATE, /ADD COLUMN auto_update_interval_seconds integer,/);
+  assert.doesNotMatch(AUTO_UPDATE, /auto_update_interval_seconds integer[^,]*NOT NULL/);
+  assert.doesNotMatch(AUTO_UPDATE, /auto_update_interval_seconds integer[^,]*DEFAULT/);
+});
+
+test('018 states no CHECK on the interval, leaving one place that explains the floor', () => {
+  // The floor lives in lib/autoUpdate.js, where a refusal can be a sentence.
+  assert.doesNotMatch(AUTO_UPDATE, /CHECK/);
+});
+
+test('018 backfills nothing and touches no response', () => {
+  assert.doesNotMatch(AUTO_UPDATE, /UPDATE|INSERT|DELETE|DROP/);
+  assert.doesNotMatch(AUTO_UPDATE, /responses/);
 });

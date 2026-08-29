@@ -23,9 +23,34 @@ Created by [Thomas Loupe](https://thomasloupe.com).
 3. Find the one-time setup link in the logs: `docker compose logs api | grep setup`
 4. Open it and create the first super administrator account (username + password). You are signed in immediately; surveys can be created and taken right away, no Discord required.
 
-To add Discord sign-in and role/channel gating, enable the **Discord Integration** plugin under Admin, Plugins, and connect your server from its settings page. You will need a [Discord application](https://discord.com/developers/applications) with a redirect URL of `<PUBLIC_URL>/api/auth/callback`, and a bot invited to your server with the `View Channels` permission. The bot never posts unless you enable the announcements plugin (which then needs `Send Messages` in the chosen channel).
+To add Discord sign-in and role/channel gating, enable the **Discord Integration** plugin under Admin, Plugins, and connect your server from its settings page. You will need a [Discord application](https://discord.com/developers/applications) with a redirect URL of `<PUBLIC_URL>/api/auth/callback`, and its bot invited to your server.
 
-Requested OAuth scopes are kept to `identify` alone. The bot token is what makes channel gating, gate configuration, adding admins by user ID, and prompt access revocation possible, because Discord exposes no OAuth scope for a guild's channel overwrites or role permissions.
+### What the Discord plugin needs
+
+Everything the plugin asks for, and what stops working without it. Nothing here is requested speculatively — if a row is not needed for the features you use, you can leave it off.
+
+**OAuth2 scopes** — what a person consents to when they sign in or take a gated survey:
+
+| Scope | Required | Why |
+| --- | --- | --- |
+| `identify` | Yes | The only user scope requested, ever. Returns the account id, username and avatar — enough to sign an admin in, to link an account, and to prove to a gated survey that the browser owns that id. |
+
+No `email`, no `guilds`, no `guilds.members.read`. Membership and roles are read with the bot token instead, which is what lets access end when somebody leaves the server rather than when their session happens to expire, and lets an admin be added by user id before they have ever signed in.
+
+**Bot permissions** — set on the invite, or on the bot's role in the server:
+
+| Permission | Required | Why |
+| --- | --- | --- |
+| `View Channels` | Yes | Lists the channels the gate configuration offers, and reads the channel overwrites the channel gate is resolved against. Without it, channel gating and the gate picker stop working; role gating still does. |
+| `Send Messages` | Only for announcements | Posting survey open/close announcements and closing reminders. Needed in the specific channel you choose, not server-wide. The bot never posts unless one of those plugins is enabled. |
+
+**Privileged gateway intents** — Developer Portal → your application → Bot:
+
+| Intent | Required | Why |
+| --- | --- | --- |
+| `SERVER MEMBERS INTENT` | Only for the identity backfill | Discord requires it to list a guild's members. Only `scripts/backfill-respondent-identity.js` does that, to recover who submitted responses recorded before a survey collected usernames. Day-to-day the plugin fetches one member at a time, which needs no intent — so leave this off unless you are running that script. |
+
+The bot needs no message content intent, and never reads messages.
 
 ## Updating
 

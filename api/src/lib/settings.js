@@ -47,7 +47,27 @@ export async function loadSettings() {
   const asciiAnimationDefault = row?.ascii_animation_default ?? true;
   const require2faAllAdmins = Boolean(row?.require_2fa_all_admins);
 
-  cache = { plugins, authMethods, discord, asciiAnimationDefault, require2faAllAdmins };
+  // Downloading a new version and restarting into it are separate switches,
+  // because they cost very different things. Both default off on a row that
+  // predates them: acquiring an unattended restart by applying a migration is
+  // the one outcome this feature must not have.
+  const autoUpdate = {
+    enabled: Boolean(row?.auto_update_enabled),
+    intervalSeconds: row?.auto_update_interval_seconds ?? null,
+    restart: Boolean(row?.auto_update_restart),
+    lastRunAt: row?.auto_update_last_run_at ?? null,
+    stagedVersion: row?.auto_update_staged_version ?? null,
+    lastError: row?.auto_update_last_error ?? null,
+  };
+
+  cache = {
+    plugins,
+    authMethods,
+    discord,
+    asciiAnimationDefault,
+    require2faAllAdmins,
+    autoUpdate,
+  };
   return cache;
 }
 
@@ -139,6 +159,34 @@ export async function saveRequire2faAllAdmins(required) {
     `INSERT INTO app_settings (id, require_2fa_all_admins) VALUES (true, $1)
      ON CONFLICT (id) DO UPDATE SET require_2fa_all_admins = $1, updated_at = now()`,
     [required],
+  );
+  return loadSettings();
+}
+
+/**
+ * Persists the automatic update schedule and refreshes the cache.
+ *
+ * The interval is taken already validated rather than validated here, so that
+ * one rule - the twice-a-day floor in `lib/autoUpdate.js` - answers for both
+ * the settings form and any direct API call.
+ *
+ * Turning the schedule off clears the interval with it. Keeping the last one
+ * would make re-enabling silently resume a cadence nobody was looking at.
+ *
+ * @param {{enabled: boolean, intervalSeconds: number|null, restart: boolean}} schedule
+ * @returns {Promise<object>} The reloaded settings.
+ */
+export async function saveAutoUpdate({ enabled, intervalSeconds, restart }) {
+  await query(
+    `INSERT INTO app_settings (id, auto_update_enabled, auto_update_interval_seconds,
+                               auto_update_restart)
+          VALUES (true, $1, $2, $3)
+     ON CONFLICT (id) DO UPDATE
+          SET auto_update_enabled = $1,
+              auto_update_interval_seconds = $2,
+              auto_update_restart = $3,
+              updated_at = now()`,
+    [Boolean(enabled), enabled ? intervalSeconds : null, Boolean(enabled) && Boolean(restart)],
   );
   return loadSettings();
 }

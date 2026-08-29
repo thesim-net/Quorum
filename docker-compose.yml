@@ -44,9 +44,19 @@ services:
       GEO_DATA_DIR: ${GEO_DATA_DIR:-/data/geoip}
       UPLOADS_DIR: /data/uploads
       TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-1}
+      # For automatic updates. _DIR is this project as mounted inside the
+      # container; _HOST_DIR is the same directory as the host knows it, since
+      # the updater's binds are resolved by the host's daemon.
+      QUORUM_COMPOSE_DIR: ${QUORUM_COMPOSE_DIR:-}
+      QUORUM_COMPOSE_HOST_DIR: ${QUORUM_COMPOSE_HOST_DIR:-}
     volumes:
       - ./data/geoip:/data/geoip
       - uploads:/data/uploads
+      # Uncomment to let Quorum update itself. The socket is root on the host,
+      # so this is opt-in; without it only the update buttons are inert.
+      #
+      # - /var/run/docker.sock:/var/run/docker.sock
+      # - .:/compose
 
   web:
     image: ghcr.io/thesim-net/quorum-web:${QUORUM_VERSION:-latest}

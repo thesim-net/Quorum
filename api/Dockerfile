@@ -9,6 +9,9 @@ RUN npm ci --omit=dev || npm install --omit=dev
 
 COPY src ./src
 
+# One-off maintenance scripts, run against a live deployment.
+COPY scripts ./scripts
+
 # A named volume mounts here; creating it owned by node in the image means the
 # fresh volume inherits that ownership, so the non-root process can write to it.
 RUN mkdir -p /data/uploads && chown -R node:node /data
