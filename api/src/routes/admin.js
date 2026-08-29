@@ -35,7 +35,7 @@ import {
   validateSchedule,
 } from '../lib/autoUpdate.js';
 import { applyUpdate, autoUpdateState, pullUpdate } from '../lib/selfUpdate.js';
-import { dockerAvailable } from '../lib/docker.js';
+import { dockerStatus } from '../lib/docker.js';
 import { requireAdmin, requireGroupAdmin, requirePanel } from '../middleware/session.js';
 import {
   ALL_PERMISSIONS,
@@ -113,12 +113,15 @@ adminRouter.get('/update', requireAdmin, async (req, res, next) => {
 adminRouter.get('/update/auto', requireAdmin, async (_req, res, next) => {
   try {
     const state = await autoUpdateState();
+    const docker = await dockerStatus();
     return res.json({
       ...state,
       ...toParts(state.intervalSeconds),
       cadence: describeInterval(state.intervalSeconds),
       minimumSeconds: MIN_INTERVAL_SECONDS,
-      dockerAvailable: await dockerAvailable(),
+      dockerAvailable: docker.available,
+      // Why not, so the page can name the actual fix rather than guessing.
+      dockerReason: docker.reason,
       composeConfigured: Boolean(process.env.QUORUM_COMPOSE_DIR),
     });
   } catch (error) {

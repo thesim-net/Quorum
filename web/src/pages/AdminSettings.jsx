@@ -641,8 +641,20 @@ function AutoUpdate() {
 
       {!state.dockerAvailable ? (
         <div className="error">
-          Quorum cannot reach the Docker socket, so it cannot download or install updates by
-          itself. Mount <code>/var/run/docker.sock</code> into the API container to enable this.
+          {state.dockerReason === 'denied' ? (
+            <>
+              The Docker socket is mounted but Quorum is not allowed to use it. The API runs as a
+              non-root user, so it also needs the socket&apos;s group: add{' '}
+              <code>group_add: [&quot;&lt;docker gid&gt;&quot;]</code> to the api service, from{' '}
+              <code>getent group docker</code> on the host.
+            </>
+          ) : (
+            <>
+              Quorum cannot reach the Docker socket, so it cannot download or install updates by
+              itself. Mount <code>/var/run/docker.sock</code> into the API container, and give it
+              the socket&apos;s group with <code>group_add</code>.
+            </>
+          )}
         </div>
       ) : null}
 

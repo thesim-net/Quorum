@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { api } from '../api.js';
 import { buildFilter, describeFilter, isFilterable, toggleFilter } from '../lib/answerFilters.js';
-import { duration, when } from '../lib/format.js';
+import { duration, truncate, when } from '../lib/format.js';
 
 /**
  * What to call one respondent.
@@ -127,6 +127,7 @@ export function SurveyRespondents() {
           <div className="row" style={{ flexWrap: 'wrap', gap: '0.5rem' }}>
             <select
               aria-label="Question to filter on"
+              style={{ maxWidth: '100%' }}
               value={question}
               onChange={(e) => {
                 setQuestion(e.target.value);
@@ -135,22 +136,23 @@ export function SurveyRespondents() {
             >
               <option value="">Choose a question</option>
               {filterable.map((entry) => (
-                <option key={entry.id} value={entry.id}>
-                  {entry.prompt}
+                <option key={entry.id} value={entry.id} title={entry.prompt}>
+                  {truncate(entry.prompt, 90)}
                 </option>
               ))}
             </select>
 
             <select
               aria-label="Answer to filter on"
+              style={{ maxWidth: '100%' }}
               value={answer}
               disabled={!chosen}
               onChange={(e) => setAnswer(e.target.value)}
             >
               <option value="">Choose an answer</option>
               {(chosen?.offered ?? []).map((option) => (
-                <option key={option.key} value={option.key}>
-                  {option.label} ({option.count})
+                <option key={option.key} value={option.key} title={option.label}>
+                  {truncate(option.label, 90)} ({option.count})
                 </option>
               ))}
             </select>
@@ -171,16 +173,19 @@ export function SurveyRespondents() {
                   key={filter}
                   type="button"
                   className={described.known ? undefined : 'danger'}
-                  title={`${described.prompt}: ${described.answer}`}
                   onClick={() => applyFilters(toggleFilter(filters, filter))}
+                  // Wrapped rather than truncated: a chip has the room a
+                  // dropdown does not, and the question is half of what the
+                  // filter means.
+                  style={{
+                    maxWidth: '100%',
+                    whiteSpace: 'normal',
+                    textAlign: 'left',
+                    lineHeight: 1.35,
+                  }}
                 >
-                  {/* Both halves, because with twenty-five questions an answer
-                      on its own does not say which question it answered. */}
-                  <span className="muted">
-                    {described.prompt.length > 44
-                      ? `${described.prompt.slice(0, 44)}...`
-                      : described.prompt}
-                  </span>{' '}
+                  <span className="muted">{described.prompt}</span>
+                  <br />
                   {described.answer} &times;
                 </button>
               );
