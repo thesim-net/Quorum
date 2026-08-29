@@ -627,7 +627,17 @@ function AutoUpdate() {
     try {
       const result = await api('/admin/update/apply', { method: 'POST' });
       if (result.status !== 'restarting') {
-        setError(result.message ?? `Could not restart: ${result.status}.`);
+        // Every refusal the API can give, in words. Most carry a message; the
+        // ones that cannot were surfacing a raw status string.
+        setError(
+          result.message ??
+            {
+              'nothing-staged': 'There is no downloaded version waiting to be applied.',
+              'not-newer': 'The downloaded version is not newer than the one running.',
+              'not-downloaded': 'That version is not on this host yet. Download it first.',
+            }[result.status] ??
+            `Could not restart: ${result.status}.`,
+        );
         return;
       }
       watchForRestart(result.version);
