@@ -12,9 +12,11 @@ import {
 } from '../lib/settings.js';
 import {
   aggregateRanking,
+  answerMatches,
   categorise,
   formatAnswer,
   numericStats,
+  offeredAnswers,
   toCsv,
 } from '../lib/results.js';
 import { deleteSurveyFiles, pathForKey } from '../lib/uploads.js';
@@ -1419,7 +1421,9 @@ adminRouter.post('/surveys/:id/anonymise', deleteSurveys, async (req, res, next)
         [req.params.id],
       );
       await client.query(
-        `UPDATE responses SET respondent_hash = gen_random_bytes(32), user_id = NULL
+        `UPDATE responses SET respondent_hash = gen_random_bytes(32), user_id = NULL,
+                              respondent_discord_id = NULL, respondent_username = NULL,
+                              respondent_display_name = NULL
           WHERE survey_id = $1`,
         [req.params.id],
       );
@@ -1626,8 +1630,14 @@ async function loadForReporting(surveyId) {
       [surveyId],
     ),
     query(
+      // Two ways a response can be attributed, and they are mutually exclusive
+      // in practice: `user_id` for a signed-in admin answering their own
+      // survey, the respondent columns for a gated survey's participants, who
+      // hold no account. Neither is set on an anonymous survey.
       `SELECT r.id, r.status, r.started_at, r.completed_at, r.duration_ms, r.country_code,
-              u.username, u.display_name
+              r.respondent_discord_id,
+              COALESCE(u.username, r.respondent_username)         AS username,
+              COALESCE(u.display_name, r.respondent_display_name) AS display_name
          FROM responses r LEFT JOIN users u ON u.id = r.user_id
         WHERE r.survey_id = $1 ORDER BY r.started_at`,
       [surveyId],
@@ -1710,6 +1720,12 @@ adminRouter.get('/surveys/:id/results', readResults, async (req, res, next) => {
 
       const categorised = categorise(question, questionOptions, questionAnswers);
 
+      // Every answer the question OFFERED, including the ones nobody chose.
+      // The categories above only know what was said, so an option with no
+      // takers is absent from them entirely - which reads as "not asked"
+      // rather than "rejected by everyone".
+      const offered = offeredAnswers(question, questionOptions, categorised.categories);
+
       // Free text is never charted. Dozens of one-off answers make a
       // meaningless chart and a very wide page, so only counts are returned
       // and the answers themselves are fetched on demand.
@@ -1717,6 +1733,7 @@ adminRouter.get('/surveys/:id/results', readResults, async (req, res, next) => {
         return {
           ...base,
           kind: 'text',
+          offered,
           categories: [],
           answered: categorised.answered,
           skipped: categorised.skipped,
@@ -1730,6 +1747,7 @@ adminRouter.get('/surveys/:id/results', readResults, async (req, res, next) => {
         return {
           ...base,
           kind: 'file',
+          offered,
           categories: [],
           answered: uploaded,
           skipped: categorised.skipped,
@@ -1744,6 +1762,7 @@ adminRouter.get('/surveys/:id/results', readResults, async (req, res, next) => {
           // picked most" does not. Order by value rather than by frequency.
           categories: [...categorised.categories].sort((a, b) => Number(a.key) - Number(b.key)),
           stats: numericStats(questionAnswers),
+          offered,
         };
       }
 
@@ -1772,6 +1791,7 @@ adminRouter.get('/surveys/:id/results', readResults, async (req, res, next) => {
             : preset,
         customCount: customTotal,
         customDistinct: custom.length,
+        offered,
       };
     });
 
@@ -1832,7 +1852,9 @@ adminRouter.get('/surveys/:id/questions/:questionId/texts', readResults, async (
 
     const question = questions[0];
     const { rows: answers } = await query(
-      `SELECT a.value, r.completed_at, u.username, u.display_name
+      `SELECT a.value, r.completed_at,
+              COALESCE(u.username, r.respondent_username)         AS username,
+              COALESCE(u.display_name, r.respondent_display_name) AS display_name
          FROM answers a
          JOIN responses r ON r.id = a.response_id
          LEFT JOIN users u ON u.id = r.user_id
@@ -1899,7 +1921,8 @@ adminRouter.get('/surveys/:id/questions/:questionId/files', readResults, async (
 
     const { rows } = await query(
       `SELECT f.id, f.original_name, f.mime, f.size_bytes, f.created_at,
-              u.username, u.display_name
+              COALESCE(u.username, r.respondent_username)         AS username,
+              COALESCE(u.display_name, r.respondent_display_name) AS display_name
          FROM answer_files f
          JOIN responses r ON r.id = f.response_id
          LEFT JOIN users u ON u.id = r.user_id
@@ -1978,7 +2001,9 @@ adminRouter.post('/surveys/:id/raffle', readResults, async (req, res, next) => {
 
     // ORDER BY random() picks uniformly among completed responses in one query.
     const { rows } = await query(
-      `SELECT r.id, u.username, u.display_name,
+      `SELECT r.id,
+              COALESCE(u.username, r.respondent_username)         AS username,
+              COALESCE(u.display_name, r.respondent_display_name) AS display_name,
               row_number() OVER (ORDER BY r.completed_at) AS ordinal
          FROM responses r LEFT JOIN users u ON u.id = r.user_id
         WHERE r.survey_id = $1 AND r.status = 'completed'
@@ -1996,6 +2021,272 @@ adminRouter.post('/surveys/:id/raffle', readResults, async (req, res, next) => {
       winner: surveys[0].collect_identity
         ? { identified: true, name: winner.display_name || winner.username || 'Unknown member' }
         : { identified: false, response: Number(winner.ordinal) },
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * Parses repeated `?answer=questionId:categoryKey` filters.
+ *
+ * A category key can itself contain a colon - a typed answer is stored as
+ * `other:whatever` - so only the FIRST colon separates the question from the
+ * answer. Splitting on every colon would quietly mangle every custom answer
+ * into an unmatchable filter.
+ *
+ * Malformed entries are dropped rather than rejected: a filter is a view of the
+ * data, and a bad link should show something rather than an error page.
+ *
+ * @param {string|string[]|undefined} raw The `answer` query parameter.
+ * @returns {Array<{questionId: string, key: string}>} Parsed filters.
+ */
+function parseAnswerFilters(raw) {
+  const list = raw === undefined ? [] : Array.isArray(raw) ? raw : [raw];
+  const filters = [];
+
+  for (const entry of list) {
+    const text = String(entry);
+    const split = text.indexOf(':');
+    if (split <= 0) continue;
+
+    const questionId = text.slice(0, split);
+    const key = text.slice(split + 1);
+    if (!/^[0-9a-f-]{36}$/i.test(questionId) || !key) continue;
+
+    filters.push({ questionId, key });
+  }
+  return filters;
+}
+
+/**
+ * The completed responses satisfying every answer filter.
+ *
+ * Filters stack as AND, because that is what narrowing a shortlist means: each
+ * one applies to what the previous left, so "chose escalate on Q9" and "chose
+ * the same action for a patron on Q11" returns the people who did both.
+ *
+ * Matching goes through `answerMatches`, the same rule the charts count by, so
+ * a filtered list can never disagree with the number on the slice it came from.
+ *
+ * @param {string} surveyId
+ * @param {Array<{questionId: string, key: string}>} filters
+ * @returns {Promise<Set<string>|null>} Matching response ids, or null when
+ *   there is nothing to filter by and every response stands.
+ */
+async function responsesMatchingAnswers(surveyId, filters) {
+  if (filters.length === 0) return null;
+
+  const questionIds = [...new Set(filters.map((filter) => filter.questionId))];
+
+  const [questions, options, answers] = await Promise.all([
+    query('SELECT id, type, config FROM questions WHERE survey_id = $1 AND id = ANY($2)', [
+      surveyId,
+      questionIds,
+    ]),
+    query('SELECT id, label, question_id FROM question_options WHERE question_id = ANY($1)', [
+      questionIds,
+    ]),
+    query(
+      `SELECT a.response_id, a.question_id, a.value
+         FROM answers a JOIN responses r ON r.id = a.response_id
+        WHERE r.survey_id = $1 AND a.question_id = ANY($2) AND r.status = 'completed'`,
+      [surveyId, questionIds],
+    ),
+  ]);
+
+  // A filter naming a question this survey does not have matches nobody.
+  // Ignoring it instead would silently widen the shortlist, which is the one
+  // failure a selection process must not have.
+  if (questions.rows.length !== questionIds.length) return new Set();
+
+  const byQuestion = new Map(questions.rows.map((question) => [question.id, question]));
+  const labelsFor = new Map(questionIds.map((id) => [id, new Map()]));
+  for (const option of options.rows) {
+    labelsFor.get(option.question_id)?.set(option.id, option.label);
+  }
+
+  // Filters on the SAME question are alternatives; filters on different
+  // questions must all hold. This is the only reading that lets "chose A or B
+  // here" be expressed at all - a single-choice answer is never two options at
+  // once, so requiring both would always return nobody and the second filter
+  // would look broken rather than misunderstood.
+  const wantedByQuestion = new Map();
+  for (const filter of filters) {
+    const keys = wantedByQuestion.get(filter.questionId);
+    if (keys) keys.push(filter.key);
+    else wantedByQuestion.set(filter.questionId, [filter.key]);
+  }
+
+  let survivors = null;
+  for (const [questionId, keys] of wantedByQuestion) {
+    const question = byQuestion.get(questionId);
+    const labels = labelsFor.get(questionId) ?? new Map();
+
+    const matching = new Set(
+      answers.rows
+        .filter(
+          (answer) =>
+            answer.question_id === questionId &&
+            keys.some((key) => answerMatches(question, labels, answer.value, key)),
+        )
+        .map((answer) => answer.response_id),
+    );
+
+    survivors =
+      survivors === null
+        ? matching
+        : new Set([...survivors].filter((id) => matching.has(id)));
+
+    // Nothing survives an empty intersection, so the remaining questions cannot
+    // change the answer.
+    if (survivors.size === 0) break;
+  }
+
+  return survivors;
+}
+
+/**
+ * Lists who has responded, one row per completed response.
+ *
+ * The charts answer "what did the group say". This answers "who answered",
+ * which is the question a selection process actually asks and the one the
+ * results page could not answer at all: an application is read one candidate at
+ * a time, not as a distribution.
+ *
+ * A survey that records no identity still lists its responses, numbered rather
+ * than named, so the detail view stays reachable either way.
+ */
+adminRouter.get('/surveys/:id/respondents', readResults, async (req, res, next) => {
+  try {
+    const { rows: surveys } = await query(
+      'SELECT collect_identity, collect_timing, collect_location FROM surveys WHERE id = $1',
+      [req.params.id],
+    );
+    if (surveys.length === 0) return res.status(404).json({ error: 'Survey not found.' });
+    const survey = surveys[0];
+
+    const filters = parseAnswerFilters(req.query.answer);
+    const allowed = await responsesMatchingAnswers(req.params.id, filters);
+
+    const { rows } = await query(
+      `SELECT r.id, r.completed_at, r.duration_ms, r.country_code, r.respondent_discord_id,
+              COALESCE(u.username, r.respondent_username)         AS username,
+              COALESCE(u.display_name, r.respondent_display_name) AS display_name,
+              -- Numbered by when the response was STARTED, which is the order
+              -- loadForReporting reads and therefore the number the export
+              -- prints. Ordering these two differently would give one response
+              -- two different names depending on where you read it.
+              row_number() OVER (ORDER BY r.started_at) AS ordinal
+         FROM responses r LEFT JOIN users u ON u.id = r.user_id
+        WHERE r.survey_id = $1 AND r.status = 'completed'
+        ORDER BY r.started_at`,
+      [req.params.id],
+    );
+
+    // Numbered before filtering, so a respondent keeps the same number however
+    // the list is narrowed - a shortlist that renumbers its rows cannot be
+    // checked against the export or against a colleague's screen.
+    const shown = allowed === null ? rows : rows.filter((row) => allowed.has(row.id));
+
+    return res.json({
+      identified: survey.collect_identity === true,
+      total: rows.length,
+      filtered: filters.length > 0,
+      respondents: shown.map((row) => ({
+        id: row.id,
+        // What to call a response when there is no name to call it by, and the
+        // same number the export prints, so the two can be read side by side.
+        ordinal: Number(row.ordinal),
+        submittedAt: row.completed_at,
+        username: survey.collect_identity ? row.username : null,
+        displayName: survey.collect_identity ? row.display_name : null,
+        discordId: survey.collect_identity ? row.respondent_discord_id : null,
+        durationMs: survey.collect_timing ? row.duration_ms : null,
+        country: survey.collect_location ? row.country_code : null,
+      })),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * One response in full: every question, and what this person answered.
+ *
+ * Formatted through the same `formatAnswer` the export uses, so a candidate
+ * read on screen and the same candidate read in a spreadsheet say the same
+ * thing rather than two subtly different things.
+ *
+ * Questions with no answer are returned too, marked rather than dropped: a
+ * blank in the middle of an application is information, and silently omitting
+ * it would make an incomplete answer look like a shorter form.
+ */
+adminRouter.get('/surveys/:id/responses/:responseId', readResults, async (req, res, next) => {
+  try {
+    // Postgres raises on a malformed uuid, which would surface as a 500 for
+    // what is only ever a bad link.
+    if (!/^[0-9a-f-]{36}$/i.test(req.params.responseId)) {
+      return res.status(404).json({ error: 'Response not found.' });
+    }
+
+    const { rows: surveys } = await query(
+      `SELECT id, title, collect_identity, collect_timing, collect_location
+         FROM surveys WHERE id = $1`,
+      [req.params.id],
+    );
+    if (surveys.length === 0) return res.status(404).json({ error: 'Survey not found.' });
+    const survey = surveys[0];
+
+    const { rows: found } = await query(
+      `SELECT r.id, r.completed_at, r.duration_ms, r.country_code, r.respondent_discord_id,
+              COALESCE(u.username, r.respondent_username)         AS username,
+              COALESCE(u.display_name, r.respondent_display_name) AS display_name
+         FROM responses r LEFT JOIN users u ON u.id = r.user_id
+        WHERE r.id = $1 AND r.survey_id = $2 AND r.status = 'completed'`,
+      [req.params.responseId, req.params.id],
+    );
+    if (found.length === 0) return res.status(404).json({ error: 'Response not found.' });
+    const response = found[0];
+
+    const [questions, options, answers] = await Promise.all([
+      query('SELECT * FROM questions WHERE survey_id = $1 ORDER BY position', [req.params.id]),
+      query(
+        `SELECT o.* FROM question_options o JOIN questions q ON q.id = o.question_id
+          WHERE q.survey_id = $1 ORDER BY o.position`,
+        [req.params.id],
+      ),
+      query('SELECT question_id, value, time_ms FROM answers WHERE response_id = $1', [response.id]),
+    ]);
+
+    const optionLabels = new Map(options.rows.map((option) => [option.id, option.label]));
+    const byQuestion = new Map(answers.rows.map((answer) => [answer.question_id, answer]));
+
+    return res.json({
+      surveyTitle: survey.title,
+      identified: survey.collect_identity === true,
+      respondent: survey.collect_identity
+        ? {
+            username: response.username,
+            displayName: response.display_name,
+            discordId: response.respondent_discord_id,
+          }
+        : null,
+      submittedAt: response.completed_at,
+      durationMs: survey.collect_timing ? response.duration_ms : null,
+      country: survey.collect_location ? response.country_code : null,
+      answers: questions.rows.map((question) => {
+        const answer = byQuestion.get(question.id);
+        return {
+          questionId: question.id,
+          prompt: question.prompt,
+          type: question.type,
+          required: question.required,
+          value: formatAnswer(question, optionLabels, answer?.value),
+          answered: Boolean(answer) && !answer.value?.skipped,
+          timeMs: survey.collect_timing ? answer?.time_ms ?? null : null,
+        };
+      }),
     });
   } catch (error) {
     return next(error);
@@ -2034,6 +2325,9 @@ adminRouter.get('/surveys/:id/export', readResults, async (req, res, next) => {
       if (survey.collect_identity) {
         record.username = response.username ?? '';
         record.displayName = response.display_name ?? '';
+        // The one identifier that survives a rename, so a reviewer can still
+        // find the member months later.
+        record.discordId = response.respondent_discord_id ?? '';
       }
       if (survey.collect_location) record.country = response.country_code ?? '';
       if (survey.collect_timing) record.durationMs = response.duration_ms ?? '';
@@ -2068,7 +2362,7 @@ adminRouter.get('/surveys/:id/export', readResults, async (req, res, next) => {
     }
 
     const headers = ['Response', 'Submitted at'];
-    if (survey.collect_identity) headers.push('Username', 'Display name');
+    if (survey.collect_identity) headers.push('Username', 'Display name', 'Discord ID');
     if (survey.collect_location) headers.push('Country');
     if (survey.collect_timing) headers.push('Total time (s)');
     for (const question of questions) {
@@ -2078,7 +2372,7 @@ adminRouter.get('/surveys/:id/export', readResults, async (req, res, next) => {
 
     const csvRows = rows.map((record) => {
       const row = [record.response, record.submittedAt];
-      if (survey.collect_identity) row.push(record.username, record.displayName);
+      if (survey.collect_identity) row.push(record.username, record.displayName, record.discordId);
       if (survey.collect_location) row.push(record.country);
       if (survey.collect_timing) row.push(Math.round((record.durationMs || 0) / 1000));
 

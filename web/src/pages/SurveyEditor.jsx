@@ -658,6 +658,17 @@ export function SurveyEditor() {
     ...groups.filter((group) => lockedGroupIds.includes(group.id)),
   ];
 
+  // Whether every way into this survey signs the respondent in. One open group
+  // leaves an anonymous way in, and an anonymous respondent is a browser cookie
+  // with no name behind it.
+  const gated = groups.length > 0 && groups.every((group) => group.requireGuild);
+
+  // A username has exactly one source, the Discord plugin, so recording one
+  // needs both halves: the survey gated, and the plugin there to answer. With
+  // either missing the toggle is a promise to participants that nothing keeps,
+  // which is worth saying on the page rather than discovering in an export.
+  const canRecordIdentity = gated && !!plugins.discord;
+
   return (
     <div className="shell">
       <p>
@@ -698,7 +709,7 @@ export function SurveyEditor() {
             // Counted per Discord account only when every group requires it:
             // one open group leaves an anonymous way in, and those respondents
             // have no account to count.
-            groups.length > 0 && groups.every((group) => group.requireGuild)
+            gated
               ? 'Counted per Discord account, since every group this survey is for signs its respondents in.'
               : 'Counted per browser, which is all an anonymous survey can know. Switch it off to let the same person answer as often as they like.'
           }
@@ -764,8 +775,22 @@ export function SurveyEditor() {
           checked={!!survey.collectIdentity}
           onChange={(collectIdentity) => patch({ collectIdentity })}
           label="Record which member submitted each response"
-          hint="Switching this off deletes the usernames already recorded here."
+          hint={
+            canRecordIdentity
+              ? 'Their Discord username and server nickname, from the server this survey is gated on. Switching this off deletes the usernames already recorded here.'
+              : 'A username comes from the Discord plugin, so this records nothing as the survey stands.'
+          }
         />
+
+        {survey.collectIdentity && !canRecordIdentity ? (
+          <div className="error">
+            This survey tells participants it records who they are, but it cannot:{' '}
+            {!plugins.discord
+              ? 'the Discord plugin is switched off.'
+              : 'it can be taken without signing in, so there is no account behind a response.'}{' '}
+            Responses will be stored without a username until that changes.
+          </div>
+        ) : null}
         <Toggle
           checked={!!survey.collectTiming}
           onChange={(collectTiming) => patch({ collectTiming })}

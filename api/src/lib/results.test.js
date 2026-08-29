@@ -1,6 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { categorise, aggregateRanking, numericStats, toCsv, csvField } from './results.js';
+import {
+  answerCategories,
+  answerMatches,
+  categorise,
+  aggregateRanking,
+  numericStats,
+  offeredAnswers,
+  toCsv,
+  csvField,
+} from './results.js';
 
 const OPTIONS = [
   { id: 'a', label: 'Alpha' },
@@ -129,4 +138,119 @@ test('csv fields are quoted and formula-guarded', () => {
 test('csv rows line up with their headers', () => {
   const csv = toCsv(['a', 'b'], [[1, 'x'], [2, 'y']]);
   assert.equal(csv, '"a","b"\r\n"1","x"\r\n"2","y"');
+});
+
+const LABELS = new Map(OPTIONS.map((o) => [o.id, o.label]));
+
+test('a filter matches exactly the people a slice counted', () => {
+  // The property that matters: anything answerCategories buckets under a key,
+  // answerMatches agrees is that key. If these two ever drift, "show me
+  // everyone who picked Alpha" silently returns a different set from the
+  // number printed on the Alpha slice.
+  const question = { type: 'single_choice', config: {} };
+  const values = [
+    { optionId: 'a', other: null },
+    { optionId: 'b', other: null },
+    { optionId: null, other: 'Gamma' },
+    { skipped: true },
+  ];
+
+  for (const value of values) {
+    for (const category of answerCategories(question, LABELS, value)) {
+      assert.equal(answerMatches(question, LABELS, value, category.key), true);
+    }
+  }
+
+  const { categories } = categorise(question, OPTIONS, answers(values));
+  for (const category of categories) {
+    const matched = values.filter((v) => answerMatches(question, LABELS, v, category.key)).length;
+    assert.equal(matched, category.count, `${category.label} disagreed`);
+  }
+});
+
+test('a multi-choice answer matches every option it selected', () => {
+  const question = { type: 'multi_choice', config: {} };
+  const value = { optionIds: ['a', 'b'], other: null };
+  assert.equal(answerMatches(question, LABELS, value, 'a'), true);
+  assert.equal(answerMatches(question, LABELS, value, 'b'), true);
+  assert.equal(answerMatches(question, LABELS, value, 'c'), false);
+});
+
+test('a skipped answer matches nothing at all', () => {
+  const question = { type: 'single_choice', config: {} };
+  assert.deepEqual(answerCategories(question, LABELS, { skipped: true }), []);
+  assert.equal(answerMatches(question, LABELS, { skipped: true }, 'a'), false);
+});
+
+test('a text answer with no text is not a category and does not throw', () => {
+  const question = { type: 'short_text', config: {} };
+  assert.deepEqual(answerCategories(question, LABELS, { text: null }), []);
+  assert.deepEqual(answerCategories(question, LABELS, {}), []);
+});
+
+test('offered answers include the options nobody picked', () => {
+  // The reason this exists. Alpha was chosen, Beta was not, and Beta has to be
+  // visible as a zero rather than absent - "nobody chose this" is a finding.
+  const question = { type: 'single_choice', config: {} };
+  const { categories } = categorise(question, OPTIONS, answers([{ optionId: 'a', other: null }]));
+
+  assert.deepEqual(
+    offeredAnswers(question, OPTIONS, categories).map((o) => [o.label, o.count]),
+    [
+      ['Alpha', 1],
+      ['Beta', 0],
+    ],
+  );
+});
+
+test('offered answers keep the order the question presents them in', () => {
+  // Not sorted by count: a candidate reads the options in the order they were
+  // asked, so the breakdown has to line up with the question.
+  const question = { type: 'single_choice', config: {} };
+  const { categories } = categorise(
+    question,
+    OPTIONS,
+    answers([{ optionId: 'b' }, { optionId: 'b' }, { optionId: 'a' }]),
+  );
+  assert.deepEqual(
+    offeredAnswers(question, OPTIONS, categories).map((o) => o.label),
+    ['Alpha', 'Beta'],
+  );
+});
+
+test('offered answers cover both sides of a boolean and the whole scale', () => {
+  const boolean = { type: 'boolean', config: { trueLabel: 'Agree', falseLabel: 'Disagree' } };
+  assert.deepEqual(
+    offeredAnswers(boolean, [], categorise(boolean, [], answers([{ bool: true }])).categories).map(
+      (o) => [o.label, o.count],
+    ),
+    [
+      ['Agree', 1],
+      ['Disagree', 0],
+    ],
+  );
+
+  const scale = { type: 'scale', config: { min: 1, max: 5 } };
+  assert.deepEqual(
+    offeredAnswers(scale, [], categorise(scale, [], answers([{ number: 2 }])).categories).map(
+      (o) => [o.label, o.count],
+    ),
+    [
+      ['1', 0],
+      ['2', 1],
+      ['3', 0],
+      ['4', 0],
+      ['5', 0],
+    ],
+  );
+});
+
+test('free text and files have no set of offered answers to enumerate', () => {
+  assert.equal(offeredAnswers({ type: 'long_text', config: {} }, [], []), null);
+  assert.equal(offeredAnswers({ type: 'file_upload', config: {} }, [], []), null);
+});
+
+test('a broken scale range enumerates nothing rather than running away', () => {
+  assert.equal(offeredAnswers({ type: 'scale', config: { min: 5, max: 1 } }, [], []), null);
+  assert.equal(offeredAnswers({ type: 'scale', config: { min: 0, max: 1e9 } }, [], []), null);
 });

@@ -22,6 +22,90 @@ export function booleanLabel(config, side) {
 }
 
 /**
+ * The categories one answer falls into.
+ *
+ * The single definition of "what does this answer count as", so that a chart
+ * slice, a filter and a per-question breakdown can never disagree about it. A
+ * multi-choice answer belongs to several categories at once; a skipped one to
+ * none.
+ *
+ * Keys are stable identifiers rather than labels: an option id for a preset
+ * choice, and a prefixed, lowercased form for anything a participant typed, so
+ * that "Yes" and "yes" merge and a custom answer can never collide with an
+ * option id.
+ *
+ * @param {object} question Question row.
+ * @param {Map<string, string>} labels Option id to label.
+ * @param {object} value The stored jsonb answer value.
+ * @returns {Array<{key: string, label: string, custom: boolean}>} Categories,
+ *   empty when the answer was skipped or carries nothing to count.
+ */
+export function answerCategories(question, labels, value) {
+  if (!value || value.skipped) return [];
+
+  const preset = (id) => ({
+    key: id,
+    label: labels.get(id) ?? 'Deleted option',
+    custom: false,
+  });
+  const typed = (prefix, text) => ({
+    key: `${prefix}:${text.toLowerCase()}`,
+    label: text,
+    custom: true,
+  });
+
+  switch (question.type) {
+    case 'single_choice': {
+      const out = [];
+      if (value.optionId) out.push(preset(value.optionId));
+      if (value.other) out.push(typed('other', value.other));
+      return out;
+    }
+
+    case 'multi_choice': {
+      const out = (value.optionIds ?? []).map(preset);
+      if (value.other) out.push(typed('other', value.other));
+      return out;
+    }
+
+    case 'boolean':
+      return [
+        { key: String(value.bool), label: booleanLabel(question.config, value.bool), custom: false },
+      ];
+
+    case 'integer':
+    case 'scale':
+      return [{ key: String(value.number), label: String(value.number), custom: false }];
+
+    case 'short_text':
+    case 'long_text':
+      // Guarded: an answer row with no text is not a category, and reading
+      // `.toLowerCase()` off nothing would take the whole results page down.
+      return value.text ? [typed('text', value.text)] : [];
+
+    // A ranking is an ordering rather than a choice. It has its own aggregate.
+    default:
+      return [];
+  }
+}
+
+/**
+ * Whether one answer falls into a given category.
+ *
+ * Defined in terms of `answerCategories` rather than repeating its rules, which
+ * is what makes "filter to everyone who picked this" return exactly the people
+ * the slice counted.
+ *
+ * @param {object} question Question row.
+ * @param {Map<string, string>} labels Option id to label.
+ * @param {object} value The stored jsonb answer value.
+ * @param {string} key The category key being filtered on.
+ * @returns {boolean} True when this answer counts towards that category.
+ */
+export const answerMatches = (question, labels, value, key) =>
+  answerCategories(question, labels, value).some((category) => category.key === key);
+
+/**
  * Buckets a set of answers into labelled categories with counts.
  *
  * Free-text answers and custom "other" answers each become their own category,
@@ -40,19 +124,6 @@ export function categorise(question, options, answers) {
   let answered = 0;
   let skipped = 0;
 
-  /**
-   * Records one occurrence of a category.
-   *
-   * @param {string} key Stable identifier used to merge equal answers.
-   * @param {string} label Display label.
-   * @param {boolean} custom Whether this came from free text rather than a preset option.
-   */
-  const add = (key, label, custom = false) => {
-    const existing = counts.get(key);
-    if (existing) existing.count += 1;
-    else counts.set(key, { key, label, count: 1, custom });
-  };
-
   for (const { value } of answers) {
     if (value?.skipped) {
       skipped += 1;
@@ -60,35 +131,10 @@ export function categorise(question, options, answers) {
     }
     answered += 1;
 
-    switch (question.type) {
-      case 'single_choice':
-        if (value.optionId) add(value.optionId, labels.get(value.optionId) ?? 'Deleted option');
-        if (value.other) add(`other:${value.other.toLowerCase()}`, value.other, true);
-        break;
-
-      case 'multi_choice':
-        for (const id of value.optionIds ?? []) {
-          add(id, labels.get(id) ?? 'Deleted option');
-        }
-        if (value.other) add(`other:${value.other.toLowerCase()}`, value.other, true);
-        break;
-
-      case 'boolean':
-        add(String(value.bool), booleanLabel(question.config, value.bool));
-        break;
-
-      case 'integer':
-      case 'scale':
-        add(String(value.number), String(value.number));
-        break;
-
-      case 'short_text':
-      case 'long_text':
-        add(`text:${value.text.toLowerCase()}`, value.text, true);
-        break;
-
-      default:
-        break;
+    for (const category of answerCategories(question, labels, value)) {
+      const existing = counts.get(category.key);
+      if (existing) existing.count += 1;
+      else counts.set(category.key, { ...category, count: 1 });
     }
   }
 
@@ -96,6 +142,65 @@ export function categorise(question, options, answers) {
     (a, b) => b.count - a.count || a.label.localeCompare(b.label),
   );
   return { categories, answered, skipped };
+}
+
+/**
+ * Every answer a question OFFERS, with how many people chose each.
+ *
+ * `categorise` counts what was said; this lists what could have been said. The
+ * difference is the whole point: an option nobody picked never appears in the
+ * counts at all, so a question where no candidate chose the right answer looks
+ * from the chart exactly like a question where nobody was asked. Zero is a
+ * result, and it takes the full option list to show one.
+ *
+ * Returns null for questions with no fixed set of answers - free text and file
+ * uploads have nothing to enumerate.
+ *
+ * @param {object} question Question row, including `config`.
+ * @param {Array<{id: string, label: string}>} options The question's options.
+ * @param {Array<{key: string, count: number}>} categories Output of `categorise`.
+ * @returns {Array<{key: string, label: string, count: number}>|null} Every
+ *   offered answer in the order it is presented, or null when there is no set.
+ */
+export function offeredAnswers(question, options, categories) {
+  const counts = new Map(categories.map((category) => [category.key, category.count]));
+  const at = (key) => counts.get(key) ?? 0;
+
+  switch (question.type) {
+    case 'single_choice':
+    case 'multi_choice':
+      return options.map((option) => ({
+        key: option.id,
+        label: option.label,
+        count: at(option.id),
+      }));
+
+    case 'boolean':
+      return [true, false].map((side) => ({
+        key: String(side),
+        label: booleanLabel(question.config, side),
+        count: at(String(side)),
+      }));
+
+    case 'scale': {
+      const min = Number(question.config?.min ?? 1);
+      const max = Number(question.config?.max ?? 5);
+      const step = Number(question.config?.step) || 1;
+      // A scale with a broken or inverted range is a configuration problem, not
+      // something to enumerate into a runaway list.
+      if (!Number.isFinite(min) || !Number.isFinite(max) || max < min) return null;
+      if ((max - min) / step > 100) return null;
+
+      const out = [];
+      for (let value = min; value <= max; value += step) {
+        out.push({ key: String(value), label: String(value), count: at(String(value)) });
+      }
+      return out;
+    }
+
+    default:
+      return null;
+  }
 }
 
 /**
