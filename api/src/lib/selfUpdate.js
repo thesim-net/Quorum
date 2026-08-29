@@ -1,6 +1,7 @@
 import { query } from '../db/pool.js';
 import { loadSettings } from './settings.js';
 import { updateStatus, parseSemver, isNewer } from './update.js';
+import { projectNameFrom } from './autoUpdate.js';
 import { VERSION } from './version.js';
 import { dockerAvailable, imagePresent, pullImage, runDetached } from './docker.js';
 
@@ -18,6 +19,23 @@ const composeDir = () => process.env.QUORUM_COMPOSE_DIR ?? null;
 
 /** Runs `docker compose up -d` for us; a container cannot recreate itself. */
 const updaterImage = () => process.env.QUORUM_UPDATER_IMAGE ?? 'docker:27-cli';
+
+/**
+ * The compose project to recreate.
+ *
+ * Named explicitly, never inferred by compose: the updater sees the project
+ * through a mount whose name is ours to choose, so letting compose guess from
+ * its working directory names the wrong project.
+ *
+ * @returns {string|null} The project name, or null when nothing names it.
+ */
+function composeProject() {
+  return (
+    process.env.COMPOSE_PROJECT_NAME ??
+    process.env.QUORUM_COMPOSE_PROJECT ??
+    projectNameFrom(process.env.QUORUM_COMPOSE_HOST_DIR ?? composeDir())
+  );
+}
 
 /**
  * Reads the schedule from the row rather than the settings cache, which is
@@ -152,6 +170,16 @@ export async function applyUpdate(requested = null) {
     }
   }
 
+  const project = composeProject();
+  if (!project) {
+    return {
+      status: 'unavailable',
+      message: 'Quorum cannot tell which compose project to restart. Set COMPOSE_PROJECT_NAME.',
+    };
+  }
+  // Quoted because it reaches compose through sh -c.
+  const projectFlag = `-p '${project.replace(/'/g, "")}'`;
+
   try {
     await runDetached({
       image: updaterImage(),
@@ -165,7 +193,7 @@ export async function applyUpdate(requested = null) {
         `if grep -q '^QUORUM_VERSION=' .env 2>/dev/null; then ` +
           `sed -i 's/^QUORUM_VERSION=.*/QUORUM_VERSION=${version}/' .env; ` +
           `else echo 'QUORUM_VERSION=${version}' >> .env; fi; ` +
-          `docker compose up -d`,
+          `docker compose ${projectFlag} up -d`,
       ],
       env: [`QUORUM_VERSION=${version}`],
       binds: [

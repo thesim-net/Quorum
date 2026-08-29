@@ -4,6 +4,7 @@ import {
   MIN_INTERVAL_SECONDS,
   describeInterval,
   isDue,
+  projectNameFrom,
   toParts,
   toSeconds,
   validateSchedule,
@@ -142,4 +143,45 @@ test('an interval describes itself in the units it was entered in', () => {
   assert.equal(describeInterval(TWELVE_HOURS), 'every 12 hours');
   assert.equal(describeInterval(86_400), 'every 1 day');
   assert.equal(describeInterval(2 * 86_400 + 3600 + 5), 'every 2 days, 1 hour, 5 seconds');
+});
+
+/**
+ * Compose derives a project name from its working directory. The updater sees
+ * the project through a mount whose name is ours to choose, so letting compose
+ * guess names the wrong project - and getting that wrong does not fail loudly.
+ * It builds a SECOND stack, with its own empty database, beside the one it was
+ * asked to upgrade. That happened once; hence these.
+ */
+
+test('the project is named after the host directory, not the mount', () => {
+  assert.equal(projectNameFrom('/opt/quorum'), 'quorum');
+});
+
+test('a trailing separator does not empty the name', () => {
+  assert.equal(projectNameFrom('/opt/quorum/'), 'quorum');
+  assert.equal(projectNameFrom('/opt/quorum///'), 'quorum');
+});
+
+test('windows paths resolve to the same name', () => {
+  assert.equal(projectNameFrom('C:\\srv\\quorum'), 'quorum');
+  assert.equal(projectNameFrom('C:\\srv\\quorum\\'), 'quorum');
+});
+
+test('the name is lowercased and stripped, as compose does it', () => {
+  // The point is to hand back the name compose already used, so a deployment in
+  // "Quorum" or "My App" recreates its own stack rather than a second one.
+  assert.equal(projectNameFrom('/srv/Quorum'), 'quorum');
+  assert.equal(projectNameFrom('/srv/My App'), 'myapp');
+  assert.equal(projectNameFrom('/srv/quorum-prod'), 'quorum-prod');
+  assert.equal(projectNameFrom('/srv/quorum_prod'), 'quorum_prod');
+});
+
+test('a path with no usable name yields nothing rather than something wrong', () => {
+  // Restarting the wrong project is worse than refusing to restart at all.
+  assert.equal(projectNameFrom('/'), null);
+  assert.equal(projectNameFrom(''), null);
+  assert.equal(projectNameFrom(null), null);
+  assert.equal(projectNameFrom(undefined), null);
+  assert.equal(projectNameFrom('///'), null);
+  assert.equal(projectNameFrom('/srv/!!!'), null);
 });
