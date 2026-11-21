@@ -5,7 +5,7 @@ RUN npm ci || npm install
 COPY . .
 RUN npm run build
 
-FROM nginx:1.27-alpine
+FROM nginx:1.30-alpine
 
 # Build provenance, stamped in by CI (.github/workflows/release.yml). The web
 # image serves static files, so the commit is surfaced in the footer via the
